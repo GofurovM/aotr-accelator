@@ -1,0 +1,11 @@
+out/
+src/*.obj
+src/*.exp
+src/*.lib
+src/*.map
+src/*.res
+*.log
+texcache/
+filewarm.lst
+package/
+AOTR_accelerator.zip

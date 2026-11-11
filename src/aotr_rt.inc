@@ -1,0 +1,4111 @@
+// ================================================================ render thread (RT) v1 (2026-09-15)
+// Moves all Direct3D 9 device work and all ID3DXEffect work off the game's render thread onto one
+// dedicated worker thread. The game's own render code keeps running on its thread (it is not
+// thread-safe), but every IDirect3DDevice9 / resource / ID3DXEffect call it makes is recorded into an
+// ordered command queue, with arguments and all pointed-to data copied at call time, and executed on
+// the worker in exactly the same order. Calls that must return live data (Get*, Create*, Lock, ...)
+// first wait for the worker to finish everything queued before them, then run on the game thread while
+// the worker is parked, so the device never sees two threads at once and the call order never changes.
+// Output is identical by construction. The gain: D3DX effect work (~16% of a battle frame) and DXVK's
+// front-end (~5%) run in parallel with the game's own frame work, for the shadow pass and the main view.
+//
+// Classes hooked (whole vtables): IDirect3DDevice9 (119), ID3DXEffect (79), Texture/Cube/Volume textures,
+// Surface, Volume, Vertex/Index buffers, StateBlock, Query, SwapChain. D3DX global functions that touch
+// the device (effect/texture creation, surface loads, mip filtering) run as one exclusive scope.
+// Kill switch: environment variable AOTR_RT=0.
+
+#include <emmintrin.h>
+#include <float.h>
+
+static volatile LONG g_rtActive = 0;
+static bool  g_rtTried = false;
+static volatile LONG g_rtInitDone = 0;
+static DWORD g_rtMainTid = 0, g_rtWorkerTid = 0;
+
+// Which thread is the game's render thread? On a build we know, an engine hook sets g_mkTid. On a build we do not,
+// nothing does - and the render thread would then never arm, silently costing the largest win there is. The thread
+// that makes ID3DXEffect calls IS that thread, so it is adopted here once it has made enough of them that a stray
+// call from a texture-loading thread cannot claim the role.
+static DWORD g_rtAdoptTid = 0;
+static LONG  g_rtAdoptN = 0;
+static bool rtAdoptGameThread(DWORD tid) {
+    // v32: no engine frame hook is installed any more (none sets g_mkTid), so the drawing thread is adopted from its
+    // own effect calls on every build - the same way it was on the builds without engine hooks.
+    if (tid != g_rtAdoptTid) { g_rtAdoptTid = tid; g_rtAdoptN = 0; return false; }
+    if (++g_rtAdoptN < 64) return false;
+    g_mkTid = tid;
+    logf("rt: the drawing thread is identified by its own work - thread %u made 64 effect calls and is treated as the game's render thread.", tid);
+    return true;
+}
+static __forceinline bool rtIsGameThread(DWORD tid) {
+    return g_mkTid ? (tid == g_mkTid) : rtAdoptGameThread(tid);
+}
+static int   g_rtDirectScope = 0;                     // game thread only: inside an exclusive D3DX scope
+static int   g_rtXDepth = 0;                          // render thread: nesting depth of D3DX global calls (install waits for 0)
+static CRITICAL_SECTION g_rtInitCs;                  // serializes rtInit between the init thread and test entry points
+static CRITICAL_SECTION g_rtExecCs;                   // held by whoever is executing device/D3DX work
+static HANDLE g_rtWake = NULL, g_rtDrained = NULL, g_rtPresented = NULL, g_rtReady = NULL;
+static volatile LONG g_rtWorkerSleeping = 0, g_rtDrainWaiting = 0, g_rtMainSleeping = 0;
+static volatile LONG g_rtQHit = 0, g_rtQMiss = 0, g_rtNStaged = 0, g_rtNStageFallback = 0;
+__declspec(align(64)) struct RtProdHot { DWORD localHead; DWORD cachedTail; DWORD seq; DWORD unpublished; LONG nAsync; LONG64 bytes; DWORD pubN; DWORD lastCpu; LONG cpuSib, cpuOther, cpuMigr; };   // game thread only
+__declspec(align(64)) struct RtPubHot  { volatile DWORD head; };                                        // game thread writes, worker reads once per batch
+__declspec(align(64)) struct RtLockHot { volatile LONG want; };                                        // game thread sets around a direct call; worker reads per record
+__declspec(align(64)) struct RtWorkHot { volatile DWORD tail; volatile DWORD execSeq; volatile LONG64 busy; volatile DWORD cpu; volatile LONG beat; };   // worker writes once per batch (beat: once per record - it is alive)
+static RtProdHot g_rtPH; static RtPubHot g_rtPB; static RtWorkHot g_rtWH; static RtLockHot g_rtLK;
+static volatile DWORD g_rtDrainSeq = 0;
+static bool g_rtObjRefs = true;                         // AddRef objects in queued records (off once every class has a Release hook)
+#define g_rtLocalHead g_rtPH.localHead
+#define g_rtSeq       g_rtPH.seq
+#define g_rtHead      g_rtPB.head
+#define g_rtTail      g_rtWH.tail
+#define g_rtExecSeq   g_rtWH.execSeq
+#define RT_BUF_SIZE (32u << 20)                        // power of two
+static BYTE* g_rtBuf = NULL;
+static volatile LONG g_rtPendingPresents = 0;
+// Present runs on the worker, so its HRESULT arrives after the game thread has already returned from Present.
+// The game thread therefore returns the result of the PREVIOUS Present. That matters in exactly one case and it
+// is the case that used to crash: the game runs fullscreen exclusive, so minimising loses the device, and the
+// engine only learns that from Present's return value. Returning a hardcoded D3D_OK meant it never learned, kept
+// drawing into a lost device and died in its own memory code on the way back. Device loss persists until a
+// successful Reset, so reporting it one frame late loses nothing - the engine sees it, calls
+// TestCooperativeLevel (which is synchronous and truthful) and resets. While the device is healthy this is 0,
+// exactly what was returned before.
+static volatile LONG g_rtPresentHR = 0;
+static volatile LONG g_rtNSync = 0, g_rtNRelease = 0, g_rtNForeign = 0, g_rtNPresent = 0, g_rtNScope = 0;
+static volatile LONG g_rtNLocked = 0, g_rtNDirectLock = 0, g_rtNDirectUnlock = 0, g_rtNMirror = 0;
+static int g_rtCurOp = 511;                                // game thread: op whose synchronous path is draining (511 = internal)
+static volatile LONG64 g_rtDrainOpTicks[512];
+static volatile LONG64 g_rtDrainTicks = 0, g_rtPresentWaitTicks = 0, g_rtPresentExecTicks = 0;
+// v28: the worst single wait for the queue in the current window, and what it was waiting on - the game thread's
+// freeze is what the player feels, and "waiting for the renderer" was the largest class of stall in test-9.
+static volatile LONG g_rtNWaitCalls = 0, g_rtWaitMaxMs = 0, g_rtWaitMaxOp = 0xFFFF, g_rtWaitMaxBehind = 0;
+static volatile LONG g_rtProdWaitMax = 0;               // v32: the longest wait for the worker since the last product report line
+static volatile LONG g_rtNWaitMaxSeen = 0;
+static volatile LONG g_rtOpN[512];                      // queued calls per op (diagnostic)
+#define g_rtNAsync g_rtPH.nAsync
+#define g_rtBytes g_rtPH.bytes
+#define g_rtBusyTicks g_rtWH.busy
+static volatile LONG g_rtSyncHist[512];
+static DWORD g_d3d9Lo2 = 0, g_d3d9Hi2 = 0, g_dxLo = 0, g_dxHi = 0;
+static unsigned int g_rtX87 = 0, g_rtMxcsr = 0;             // game thread floating-point state, mirrored on the worker
+static volatile LONG g_rtInstalled = 0;                       // worker running and all vtables hooked (toggle-able)
+static volatile LONG g_rtWantOn = 1, g_rtToggles = 0;           // live A/B switch (Scroll Lock), applied at Present on the render thread
+// v28 "core" mode ([Engine] Engine=core, or SafeMode=1; the default). The whole render half is still installed -
+// the texture cache, the texture workers, the warm lists, the v27 lock admission, the read-ahead, the overlay - but
+// no D3D call is ever queued: every hook takes the direct path, on the game thread, and nothing waits for a worker.
+// Measured on test-9: the queue handoff was where the tool lost to vanilla (27 fps, 166 stalls, the worst ones at
+// queue depth 6800-27800 calls/frame), while the disk cache and the lock admission are what it won. Core keeps the
+// wins and drops the cost. The Insert key switches to full mode live, so one session measures both (see the AB lines).
+static volatile LONG g_rtCoreMode = 1;
+// ---------------------------------------------------------------- adaptive bypass (v28)
+// The measurement the escalation is built on (2026-10-20, test-9, a real 4v4): with the render thread on, the game
+// ended a session at 27 fps with 166 stalls of 100 ms or more, and the stalls landed exactly where the queue had
+// burst - 3360 ms at queue depth 6807 calls/frame, 1338 ms at 25883/f - while the queue's own drain time stayed
+// small (0.05-0.55 ms/frame). Waiting for the renderer was the single largest class of stall. The same session with
+// the render thread switched off entirely ran BETTER. So the render thread must be able to take itself out of the
+// game's way by itself, per session, on measurements - not on a knob the player has to find.
+//
+// What it does when it engages: it stops QUEUEING and every call runs directly on the game thread again - exactly the
+// path the Insert key has switched to since v27, so there is nothing new to trust. The worker drains what is already
+// queued and then sleeps; nothing is abandoned. What keeps running is everything that does not depend on the queue:
+// the frame counters, the stall recorder, the 60 s report, the read-out, the texture cache's read-ahead and warm
+// lists, and the call de-dupe (which runs on whichever thread is making the calls). It stays engaged for the rest of
+// the session - it is a per-session self-protection, not a per-frame flicker - and it says so in the log once.
+//
+// It is not a guess: it fires only on measurements a run has already produced.
+static volatile LONG g_rtBypassOn = 1;                          // [Engine] AdaptiveBypass: 1 = on, 0 = never engage (A/B it)
+static volatile LONG g_rtBypassFired = 0;                       // engaged, once
+static volatile LONG g_rtBypassWhy = 0;                         // 0 none, 1 queue depth, 2 a wait for the queue, 3 stalls
+static LONG g_rtBypQueueDepth = 2500;                           // calls/frame in the queue that mean the queue is bursting
+static LONG g_rtBypWaitMs = 250;                                // one wait for the queue, in ms, that means the worker has fallen behind
+// v34 (ISH-8 #3): test-14 lost the render thread for a whole 25-minute game to ONE 371 ms wait during the map load
+// (15:08:00, 0:08 into the run) - the rest of the game drew on the game thread (CLIENT+DRAWING 44.0 ms, 18.8 fps).
+// Now: while no logic step has run for 3 s (a map loading, a menu) the limit is 2500 ms; and a step-aside lasts 10 s,
+// then the render thread is tried again - three times; only a fourth freeze keeps it aside for the session.
+static LONG g_rtBypWaitLoadMs = 2500;
+static volatile LONG g_rtBypassN = 0;                           // freezes so far (each one a step-aside)
+static volatile DWORD g_rtBypassRetryAt = 0;                    // GetTickCount when the render thread is tried again (0 = not planned)
+#define RT_BYP_RETRIES 3
+static __forceinline bool rtLoadingNow() { DWORD l = g_frLastLogicTick; return !l || GetTickCount() - l > 3000; }
+static __forceinline LONG rtBypLimitMs() { return rtLoadingNow() ? g_rtBypWaitLoadMs : g_rtBypWaitMs; }
+static LONG g_rtBypStalls = 12;                                 // 100 ms+ stalls in a five-second window
+static volatile LONG g_rtKey = VK_SCROLL;                      // [Engine] RtKey: which key flips the switch live. 0 = no key.
+static void rtBypassEngage(const char* why, const char* how);
+static void rtBypassRetryTick();
+static DWORD WINAPI rtProdReport(LPVOID);
+                                                               // Many laptops have no Scroll Lock and some have no Pause, so the
+                                                               // switch has to be answerable with a key the machine actually has.
+
+struct RtRec {
+    WORD  kind;      // 1 = call, 2 = wrap to buffer start
+    BYTE  nargs;     // stdcall arguments including `this`
+    BYTE  flags;     // bit0 = Present (frame bookkeeping after execution)
+    DWORD size;      // whole record, 16-byte aligned
+    void* fn;        // original (unhooked) method
+    DWORD seq;
+    WORD  objMask;   // bit i: args[i] is a COM object to Release after the call
+    WORD  op;
+    DWORD pad;
+};
+
+static __forceinline DWORD rtAl16(DWORD n) { return (n + 15) & ~15u; }
+static __forceinline DWORD* rtArgs(RtRec* r) { return (DWORD*)(r + 1); }
+static __forceinline BYTE* rtPayload(RtRec* r) { return (BYTE*)r + rtAl16(sizeof(RtRec) + (DWORD)r->nargs * 4); }
+static void rtDrain();
+// what the render thread is executing right now, for the profiler that samples it (aotr_loadprof.inc): two plain
+// stores a record, on a cache line of their own
+__declspec(align(64)) struct RtDiagHot { volatile WORD op; volatile BYTE kind, pass; volatile LONG on; };
+static RtDiagHot g_rtDg;
+// several unit meshes in one draw call (aotr_merge.inc, included after this file)
+static volatile LONG g_mgAny = 0, g_mgPendN = 0;     // multi-copy buffer twins live / waiting to be built
+static DWORD mgAlias(DWORD buf);                     // a vertex or index buffer -> its multi-copy twin, or itself
+static void mgOnWriteLock(DWORD buf);
+static void mgDropAll(const char* why);
+static void mgFrameTick();
+static void mgToggle();
+// in-between frames (aotr_tween.inc, included after this file)
+static volatile LONG g_twHold = 0;                   // render thread: the ring space from g_twHoldTail on is not given back yet
+static volatile DWORD g_twHoldTail = 0;
+static volatile LONG g_twGiveUp = 0;                 // game thread: the ring is full, let go of it
+static volatile LONG g_twBusy = 0;                   // the render thread has something to do between records
+static LONG g_twStretch = 0;                         // render thread: a marked stretch of a frame is being executed for the first time
+static RtRec* g_twPresentRec = NULL;                 // render thread: the Present record being executed
+static BYTE g_twOpClass[512];                        // queued calls: 1 release (waits inside a stretch), 2 once only, 3 delete (waits)
+static volatile LONG g_twFxGen = 1;                  // bumped when an effect is released: what its handles meant is forgotten
+static void twOnSync(int op);
+static void twOnDirectWrite(int op);
+static bool twStretchOpenGt();                       // game thread: a marked stretch is open and still meant to be run again
+static DWORD g_twGtSerial = 0;                       // game thread: counts the marks
+static void twExecCtl(RtRec* r);
+static bool twHoldBack(RtRec* r);
+static bool twDefer(void* fn, DWORD a0, DWORD a1, DWORD two);
+static void twService();
+static void twServicePictures();
+static DWORD twIdleWaitMs();
+static volatile LONG64 g_pwSlotDue = 0;                    // (aotr_panwarp.inc) while pictures go up on the screen's beat: when the next one has to be handed over (0: not now)
+static void twSpacePressure();
+static void twOnReset();
+static void twResetRefused(DWORD hr);
+static void spWrap();                                   // (aotr_shadowpcf.inc) the device's SetPixelShader, wrapped once the table is hooked
+static void twInitOnce();
+static void twWrap();
+static void twToggle();
+static void twBeatToggle();
+static void pwToggle();
+static BYTE twFrameEnd();
+// texture decoding off the game thread (aotr_texjobs.inc, included after this file)
+static volatile LONG g_txjOn = 0;
+static bool txjCheckReq(DWORD* A, DWORD* hr);
+static bool txjCreateTexture(DWORD* A, DWORD* hr);
+static bool txjCreateFromFile(DWORD* A, DWORD* hr);
+static bool txjLoadSurface(DWORD* A, DWORD* hr);
+static bool txjFilter(DWORD* A, DWORD* hr);
+static bool txjLoadSurfaceFile(DWORD* A, DWORD* hr);
+static bool txjFlushNow(DWORD tex);
+static volatile LONG64 g_txjRtWaitTicks = 0;          // (aotr_texjobs.inc) the render thread waiting for decoding threads
+struct RtDirRel { DWORD obj, ra; LONG scope; }; static RtDirRel g_rtDirRel[64]; static volatile LONG g_rtDirRelN = 0;   // v33: the last textures the game thread released directly (diagnosis)
+static void txjLockWrite(DWORD tex, DWORD surf);   // v33: a write lock by the game: the texture's decoding chain (if any) no longer knows its levels
+static void txjExecUpload(RtRec* r);
+static void txjOnInstall(void* dev);
+static void txjOnReset();
+static void rtInstall(void* fx);
+static const char* rtOpName(int op);
+static DWORD WINAPI rtKeyThread(LPVOID);
+static void rtQForget(DWORD fx);
+
+// Sequence numbers are 32-bit and wrap (a long session queues several billion calls). Everything in flight fits
+// in half the ring, so two sequence numbers are never more than 2^31 apart: compare them modulo 2^32.
+static __forceinline bool rtSeqReached(DWORD cur, DWORD target) { DWORD d = target - cur; return d == 0 || d >= 0x80000000u; }
+
+// Per object (hashed), the sequence number of the newest queued record that names it - game thread only.
+// A synchronous call on an object none of whose records is still pending can run without draining the queue:
+// nothing still queued can change what it observes. Hash collisions only make an object look busy.
+#define RT_REFN 16384
+static DWORD g_rtRefSeq[RT_REFN];
+static __forceinline DWORD rtRefIdx(DWORD o) { return ((o >> 3) ^ (o >> 17)) & (RT_REFN - 1); }
+#ifdef AOTR_V4_NOTOUCH
+static __forceinline void rtTouch(DWORD) {}
+#else
+static WORD g_rtRefOp[RT_REFN];                                                           // the op of that record (diagnostic)
+// The hashed table answers "maybe pending": with ~1500 textures named per frame, 9% of the slots are busy, and the
+// v23 log shows exactly that share of the system-memory staging locks waiting for the whole queue because some
+// unrelated texture shared their slot ("named by ib.Unlock", "by dev.QueryInterface"...). The few objects the game
+// actually locks get an exact entry of their own the first time they are asked about: from then on a touch of their
+// slot also updates that entry (one byte test on the hot path), and the answer for them is no longer a guess.
+#define RT_XN 192                                                                          // v25: 48 entries were recycled every few seconds by freshly loaded textures
+struct RtXRef { DWORD obj, seq, lastUse; WORD op, pad; };       // op: the queued call that named it last (0xFFFF unknown)
+static RtXRef g_rtX[RT_XN];
+static BYTE g_rtXMark[RT_REFN];                                                            // 0 none, k = entry k-1 lives in this slot, 0xFF = more than one
+static LONG g_rtXN = 0;
+static volatile LONG g_rtNXHit = 0, g_rtNXSaved = 0, g_rtNXAdd = 0, g_rtNXEvict = 0;
+// Exact-object index, game thread only. Bucket links store array index + 1;
+// zero ends a chain. Explicit unlinking keeps eviction from leaving stale keys.
+#define RT_XHASHN 512
+static WORD g_rtXHead[RT_XHASHN], g_rtXNext[RT_XN];
+static __forceinline DWORD rtXHash(DWORD o) { return ((o >> 3) * 2654435761u) >> 23; }
+static __forceinline LONG rtXFind(DWORD o) {
+    for (WORD link = g_rtXHead[rtXHash(o)]; link; link = g_rtXNext[link - 1]) {
+        LONG i = link - 1;
+        if (g_rtX[i].obj == o) return i;
+    }
+    return -1;
+}
+static void rtXIndexRemove(LONG i) {
+    if (!g_rtX[i].obj) return;      // an unlinked entry: hashing 0 lands in bucket 0 and would cut a chain not ours
+    WORD* link = &g_rtXHead[rtXHash(g_rtX[i].obj)];
+    while (*link && *link != i + 1) link = &g_rtXNext[*link - 1];
+    if (*link) *link = g_rtXNext[i];
+    g_rtXNext[i] = 0;
+}
+static void rtXIndexAdd(LONG i) {
+    DWORD bucket = rtXHash(g_rtX[i].obj);
+    g_rtXNext[i] = g_rtXHead[bucket];
+    g_rtXHead[bucket] = (WORD)(i + 1);
+}
+static void rtXTouchSlow(DWORD o, DWORD seq, BYTE mark, WORD op) {
+    if (mark != 0xFF) { RtXRef& x = g_rtX[mark - 1]; if (x.obj == o) { x.seq = seq; x.op = op; } return; }
+    LONG i = rtXFind(o);
+    if (i >= 0) { g_rtX[i].seq = seq; g_rtX[i].op = op; }
+}
+// v26: a second table under an independent hash. Each table alone never misses a pending object (an object's slot
+// always carries a sequence number at least as new as its own), so "pending only if BOTH say so" never misses one
+// either - but a false alarm now needs a collision in both tables at once (~1% instead of ~10-20%). v25 showed the
+// remaining waits on small system-memory uploads all came from objects without an exact entry, answered by the one
+// shared slot.
+static DWORD g_rtRefSeq2[RT_REFN];
+static __forceinline DWORD rtRefIdx2(DWORD o) { return (o * 2654435761u) >> 18; }           // top 14 bits of a multiplicative hash
+static volatile LONG g_rtNH2Saved = 0;
+static __forceinline void rtTouch(DWORD o, WORD op = 0xFFFF) {                              // before rtCommit: the record's own seq
+    DWORD i = rtRefIdx(o), q = g_rtSeq + 1;
+    g_rtRefSeq[i] = q;
+    g_rtRefSeq2[rtRefIdx2(o)] = q;
+    if (g_rtXMark[i]) rtXTouchSlow(o, q, g_rtXMark[i], op);
+}
+#endif
+static __forceinline bool rtSeqPending(DWORD e) {
+    if ((DWORD)(g_rtSeq - e) > (1u << 24)) return false;                                     // older than anything the ring can hold
+    DWORD d = e - g_rtExecSeq;
+    return d != 0 && d < 0x80000000u;
+}
+#ifdef AOTR_V4_NOTOUCH
+static __forceinline bool rtRefPending(DWORD o) { return rtSeqPending(g_rtRefSeq[rtRefIdx(o)]); }
+#else
+static void rtXRemark(DWORD slot) {                                                         // recompute one slot's mark
+    int n = 0, k = 0;
+    for (LONG i = 0; i < g_rtXN; ++i) if (g_rtX[i].obj && rtRefIdx(g_rtX[i].obj) == slot) { ++n; k = (int)i + 1; }
+    g_rtXMark[slot] = n == 0 ? 0 : (n == 1 ? (BYTE)k : 0xFF);
+}
+static WORD g_rtPendOp = 0xFFFF; static BYTE g_rtPendExact = 0;                             // why the last rtRefPending said "pending" (diagnostic)
+static DWORD g_rtPendSeq = 0;                                                               // ... and the record to wait for: the newest one naming the object (or a later one)
+static bool rtRefPending(DWORD o) {                                                         // call with the exec lock held (game thread)
+    DWORD slot = rtRefIdx(o), hashed = g_rtRefSeq[slot];
+    LONG i = rtXFind(o);
+    if (i >= 0) {
+        g_rtX[i].lastUse = (DWORD)g_mkFrames; g_rtNXHit++;
+        bool pend = rtSeqPending(g_rtX[i].seq);
+        if (!pend && rtSeqPending(hashed)) g_rtNXSaved++;                                     // the shared slot alone would have said "wait"
+        if (pend) { g_rtPendOp = g_rtX[i].op; g_rtPendExact = 1; g_rtPendSeq = g_rtX[i].seq; }
+        return pend;
+    }
+    g_rtPendOp = g_rtRefOp[slot]; g_rtPendExact = 0;
+    LONG k = -1;                                                                              // first question about this object: give it an entry
+    if (g_rtXN < RT_XN) k = g_rtXN++;
+    else {
+        DWORD oldest = 0;
+        for (LONG i = 0; i < RT_XN; ++i) {                                                    // replace the least recently asked-about entry that is not pending
+            if (rtSeqPending(g_rtX[i].seq)) continue;
+            DWORD age = (DWORD)g_mkFrames - g_rtX[i].lastUse;
+            if (k < 0 || age > oldest) { k = i; oldest = age; }
+        }
+        if (k >= 0) { DWORD os = rtRefIdx(g_rtX[k].obj); rtXIndexRemove(k); g_rtX[k].obj = 0; rtXRemark(os); g_rtNXEvict++; }
+    }
+    DWORD hashed2 = g_rtRefSeq2[rtRefIdx2(o)];
+    bool p1 = rtSeqPending(hashed), p2 = rtSeqPending(hashed2);
+    if (p1 && !p2) g_rtNH2Saved++;
+    DWORD best = (p1 && p2) ? ((DWORD)(hashed - hashed2) < 0x80000000u ? hashed2 : hashed) : (p1 ? hashed2 : hashed);   // the older of two upper bounds is still an upper bound
+    if (k >= 0) { g_rtX[k].obj = o; g_rtX[k].seq = best; g_rtX[k].op = 0xFFFF; g_rtX[k].lastUse = (DWORD)g_mkFrames; rtXIndexAdd(k); rtXRemark(slot); g_rtNXAdd++; }
+    g_rtPendSeq = best;
+    return p1 && p2;
+}
+#endif
+
+static volatile LONG g_rtCpuHistW[64], g_rtCpuHistM[64];
+static volatile LONG g_rtWaitCalls = 0, g_rtWaitTimeouts = 0, g_rtDrains = 0, g_rtWorkerSleeps = 0, g_rtWorkerTimeouts = 0;
+static volatile LONG64 g_rtWaitTicks = 0;
+// WINDOW MESSAGES INSIDE A WAIT. A render thread that is inside the driver may send this thread's window a message
+// (a window change) and wait for the answer; if this thread is waiting for the render thread at that moment, neither
+// moves again - so a wait lets messages *sent* from other threads through. But a message handled here is handled in
+// the middle of whatever the game was doing when it called Direct3D, which the game never sees without us (Direct3D
+// does not run its window procedure for it), and one of them is not harmless: on WM_ACTIVATEAPP the game resets the
+// device from its window procedure (0x442A44 -> Set_Render_Device -> Reset_Device) and releases every dynamic
+// buffer and texture on the way - under the feet of the frame or the load it was in the middle of. Up to v66 every
+// wait let messages through at once, so an alt-tab that fell into a wait in the middle of a frame did exactly that.
+// Now: at the end of a frame (the wait after Present) as before - the game is between frames there - and anywhere
+// else only once the render thread has not finished a record for a tenth of a second, which is what "it is waiting
+// for our answer" looks like from here. A render thread that is merely busy keeps finishing records.
+struct RtStuck { LONG beat; LONG64 at; };
+static volatile LONG g_rtNPump = 0, g_rtNPumpStuck = 0;
+static __forceinline void rtStuckBegin(RtStuck& s) { s.beat = g_rtWH.beat; s.at = qpcNow(); }
+static __forceinline bool rtStuckNow(RtStuck& s) {
+    LONG b = g_rtWH.beat; LONG64 now = qpcNow();
+    if (b != s.beat) { s.beat = b; s.at = now; return false; }
+    return now - s.at > g_pqpf.QuadPart / 10;
+}
+static void rtWaitH(HANDLE h, DWORD ms, bool pump) {
+    LONG64 tw = qpcNow();
+    DWORD w = pump ? MsgWaitForMultipleObjects(1, &h, FALSE, ms, QS_SENDMESSAGE) : WaitForSingleObject(h, ms);
+    g_rtWaitTicks += qpcNow() - tw; g_rtWaitCalls++; if (w == WAIT_TIMEOUT) g_rtWaitTimeouts++;
+    if (pump && w == WAIT_OBJECT_0 + 1) { MSG m; g_rtNPump++; PeekMessageA(&m, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE); }
+}
+// ---------------------------------------------------------------- effect parameter writes, batched
+// About 55k of the ~135k calls queued in a battle frame are ID3DXEffect parameter writes (SetVector, SetMatrix,
+// SetFloat, SetInt, SetBool, SetTexture, SetRawValue), in runs of ~20 between a Begin and a CommitChanges. D3DX
+// does almost nothing in them (a direct SetVector is ~5 ns), so as one full record each (~25-30 ns: header, space
+// check, sequence number, publish bookkeeping) the queue's own overhead was most of their cost. A run now goes
+// into ONE record (kind 8) as compact entries {slot, effect, handle, value or bytes}; the worker replays the
+// entries in order with the original methods, so D3DX sees exactly the same calls in exactly the same order.
+// The open batch is game-thread state and is closed (committed) before anything else can enter or wait for the
+// queue: rtAlloc and rtDrain close it first, so the record order and every drain target are what they were.
+// An object named by a batched SetTexture is stamped with the sequence number the batch will get, as before.
+// Kill switch: AOTR_FXBATCH=0.
+#define RT_FX_CAP  8192u
+#define RT_FX_MAXN 1024u
+// Written for every entry by the game thread, so it gets a cache line of its own: next to anything the worker reads
+// or writes, each entry would cost a cache-line transfer (measured: 13 -> 26 ns per call). The worker gets the
+// effect's method table through the record itself (its fn field), not through shared state.
+__declspec(align(64)) struct RtFxHot { RtRec* rec; BYTE* base; DWORD pos, n; LONG on; LONG nBatch, nEntry; LONG opN[8]; };
+static RtFxHot g_rtFx = { NULL, NULL, 0, 0, 1, 0, 0, { 0, 0, 0, 0, 0, 0, 0, 0 } };
+#define g_rtFxRec     g_rtFx.rec
+#define g_rtFxBase    g_rtFx.base
+#define g_rtFxPos     g_rtFx.pos
+#define g_rtFxN       g_rtFx.n
+#define g_rtFxBatchOn g_rtFx.on
+#define g_rtNFxBatch  g_rtFx.nBatch
+#define g_rtNFxEntry  g_rtFx.nEntry
+static const WORD kRtFxOp[8] = { 142, 146, 150, 154, 158, 164, 172, 198 };   // SetBool, SetInt, SetFloat, SetVector, SetMatrix, SetMatrixTranspose, SetTexture, SetRawValue
+static void rtFxClose();
+// v38: an open run of engine pixel writes to one surface (see rtPixelAdd); closed like the effect batch, before anything
+// else is queued and before any wait for the queue.
+#define RT_PX_MAXN 2048u
+static RtRec* g_rtPxRec = NULL; static DWORD* g_rtPxBase = NULL; static DWORD g_rtPxSurf = 0, g_rtPxN = 0;
+static volatile LONG g_rtNPxBatch = 0, g_rtNPxEntry = 0;
+static void rtPxClose();
+
+static RtRec* rtAlloc(int nargs, DWORD pl) {
+    if (g_rtFxRec) rtFxClose();                          // nothing may be queued behind an open batch's back
+    if (g_rtPxRec) rtPxClose();
+    DWORD need = rtAl16(sizeof(RtRec) + (DWORD)nargs * 4) + rtAl16(pl) + 96;   // + per-item alignment slack
+    for (;;) {
+        DWORD head = g_rtLocalHead;
+        DWORD used = (head - g_rtPH.cachedTail) & (RT_BUF_SIZE - 1);            // stale tail only overestimates
+        if (used + need + 65536 > RT_BUF_SIZE / 2) {
+            g_rtPH.cachedTail = g_rtTail;
+            used = (head - g_rtPH.cachedTail) & (RT_BUF_SIZE - 1);
+            if (used + need + 65536 > RT_BUF_SIZE / 2) { if (g_twHold) twSpacePressure(); rtDrain(); g_rtPH.cachedTail = g_rtTail; continue; }   // never more than half the ring in flight
+        }
+        if (head + need + sizeof(RtRec) > RT_BUF_SIZE) {
+            RtRec* w = (RtRec*)(g_rtBuf + head); w->kind = 2; w->size = 0;
+            g_rtLocalHead = 0; g_rtHead = 0; g_rtPH.unpublished = 0;            // everything before the wrap is complete: publish it
+            if (g_rtWorkerSleeping) SetEvent(g_rtWake);
+            continue;
+        }
+        RtRec* r = (RtRec*)(g_rtBuf + head);
+        r->kind = 1; r->nargs = (BYTE)nargs; r->flags = 0; r->size = need; r->fn = NULL; r->objMask = 0; r->op = 0; r->pad = 0;
+        return r;
+    }
+}
+static __forceinline void rtPublish() {
+#ifdef AOTR_V4_CPUSTAT
+    g_rtCpuHistM[GetCurrentProcessorNumber() & 63]++;
+#endif
+    g_rtHead = g_rtLocalHead;
+    g_rtPH.unpublished = 0;
+    if (g_rtWorkerSleeping) SetEvent(g_rtWake);
+    PSTAT(if ((++g_rtPH.pubN & 7) == 0) {                // where are the two threads? (Intel: logical processors 2k and 2k+1 share a core)
+        DWORD m = GetCurrentProcessorNumber(), w = g_rtWH.cpu;
+        if (m != g_rtPH.lastCpu) { g_rtPH.lastCpu = m; g_rtPH.cpuMigr++; }
+        if ((m ^ w) == 1) g_rtPH.cpuSib++; else g_rtPH.cpuOther++;
+    });
+}
+static void capRecord(RtRec* r, DWORD po);
+__declspec(align(64)) struct RtDevShadow { DWORD dev, ib, decl; DWORD vb[16], off[16], stride[16]; DWORD vbOk; LONG ibOk, declOk, recording, on; LONG nSkip, nSet; };
+static RtDevShadow g_rtDs;
+static __forceinline void rtDsInvalAll() { g_rtDs.vbOk = 0; g_rtDs.ibOk = 0; g_rtDs.declOk = 0; }
+static __forceinline void rtDsInvalDecl() { g_rtDs.declOk = 0; }
+static __forceinline void rtDsInvalUP(int indexed) { g_rtDs.vbOk &= ~1u; if (indexed) g_rtDs.ibOk = 0; }
+static __forceinline void rtDsRecording(int on) { g_rtDs.recording = on; rtDsInvalAll(); }
+
+// ---------------------------------------------------------------- device state that is already set (v28)
+// The same idea taken to the eight plain state setters, measured on the test-9 log of a real 4v4: SetSamplerState
+// 965 calls a frame, SetTextureStageState 895, SetTransform 503, SetRenderState 483, SetTexture 348, SetViewport
+// 158, SetMaterial 146, SetFVF 142 - about 3,600 calls a frame, and the render list is sorted by model, so most of
+// them set what is already set. Setting a device state to the value it already holds changes nothing in Direct3D,
+// so the call is not queued at all (and, with the render thread engaged or bypassed, not made).
+//
+// This is what the queue has set, in queue order; the worker sets each one exactly once, in the same order, so when
+// the last queued call for a slot is gone the device really does hold that value. The shadow is dropped by
+// everything that can change device state behind it: a device Reset, a state-block Capture or Apply (which read and
+// write whole state blocks), any call that does not go through the queue (another thread, a direct scope, the render
+// thread off) and, for a texture slot, a texture that is released. Textures are keyed by pointer: a bound texture
+// cannot be freed and its address reused while it is bound (the device holds it), so equal pointers mean the same
+// object - and a release drops the whole texture row, so even that is covered. Kill switch: AOTR_CALLDEDUPE=0.
+struct RtStateShadow {
+    DWORD dev;
+    LONG  on, invalidOffQueue;
+    // one row of 256 for each (slot, state) pair: RenderState 256, SamplerState = stage*32+type (up to 8 stages),
+    // TextureStageState = stage*32+type, Texture = stage, Transform = stateType (up to 512 named), Material/Viewport/FVF one value
+    DWORD rs[256], ss[8 * 32], tss[8 * 32], tex[8], tf[512][16], fvf;
+    DWORD rsOk, ssOk[8], tssOk[8], texOk, tfOk, fvfOk;
+    LONG nSkip, nSet, nSkipRS, nSkipSS, nSkipTSS, nSkipTex, nSkipTF, nSkipMtl, nSkipVP, nSkipFVF;
+    LONG nInvalid, nInvalidWhy[4];                 // 0 off-queue, 1 reset, 2 state block, 3 other
+    // Material and viewport are stored whole, as a second copy: 68 and 24 bytes, the same as the record carries
+    DWORD mtl[17], vp[6]; LONG mtlOk, vpOk;
+};
+static RtStateShadow g_rtSS;
+static __forceinline void rtSSInvalidate() {
+    g_rtSS.rsOk = 0; g_rtSS.texOk = 0; g_rtSS.tfOk = 0;
+    g_rtSS.mtlOk = 0; g_rtSS.vpOk = 0; g_rtSS.fvfOk = 0;
+    for (int i = 0; i < 8; ++i) { g_rtSS.ssOk[i] = 0; g_rtSS.tssOk[i] = 0; }
+    g_rtSS.nInvalid++;
+}
+static __forceinline void rtSSInvalidReason(int why) { g_rtSS.nInvalidWhy[why & 3]++; }
+// the render thread is off, or this is another thread, or a direct scope: the queue is not what is (or was) setting
+// this state, so the shadow cannot be trusted to describe the device from here on.
+static __forceinline bool rtSSOffQueue(int tid) {
+    // CORE mode: nothing is ever queued, so there is no shadow to keep and nothing to invalidate. This is the hot
+    // path (7 of the eight setters in the generated hooks), and it must stay as cheap as the vanilla call.
+    if (g_rtCoreMode) return true;
+    if (tid != g_rtMainTid || !g_rtActive || g_rtDirectScope) {
+        if (g_rtSS.on) { rtSSInvalidate(); rtSSInvalidReason(0); g_rtSS.invalidOffQueue++; }
+        return true;
+    }
+    return false;
+}
+static __forceinline bool rtSSBase() { return g_rtSS.on && !g_rtDs.recording; }
+// ---- v29: the shadow in CORE mode
+// In CORE mode there is no queue: every call runs on the game thread, in the engine's own order, the
+// instant it is made. That makes "what does the device hold" EXACTLY equal to "what was the last
+// value set on this thread" - the strongest form of this shadow, with none of the queue-order
+// reasoning the FULL path needs (no Apply sequence to respect, because an Apply has already run).
+// It was returning true unconditionally here, which turned the whole de-dupe off in the mode that
+// shipped as the default: the log of his session shows "dropped/f 0.0 kept/f 0.0" for ten minutes.
+// The one thing that must still be honoured is a call arriving from another thread - then this
+// shadow does not describe the device any more (the v28 rule), so it is dropped there as before.
+static __forceinline bool rtSSCoreOK(DWORD tid) {
+    if (tid != g_rtMainTid) {
+        if (g_rtSS.on) { rtSSInvalidate(); rtSSInvalidReason(0); g_rtSS.invalidOffQueue++; }
+        return false;
+    }
+    return true;
+}
+// A state block's Apply is the one call that can put ANY device state back to a value the queue did not set. It is
+// queued, so it runs at its own position in the queue - which means the shadow can only be trusted while no such
+// Apply is still waiting to run, and a setter that arrives in that window must not write the shadow either (the
+// Apply will overwrite whatever it wrote). Same for a device Reset. g_rtSSApplySeq is the queue number of the last
+// Apply/Reset queued; rtSeqPending is the same test the v27 lock admission uses for the same reason.
+static DWORD g_rtSSApplySeq = 0;
+static __forceinline bool rtSSOn() {
+    if (!rtSSBase()) return false;
+    if (g_rtCoreMode) return true;                       // v29: core mode - the last set on this thread IS what the device holds
+    if (g_rtSSApplySeq && rtSeqPending(g_rtSSApplySeq)) return false;
+    return true;
+}
+// The eight setters, in queue order. Each returns true when the call would set what is already set and may be
+// dropped. `dev` guards against a second device: a call on another device cannot be answered from this shadow.
+static __forceinline bool rtSSSkipRS(DWORD dev, DWORD a0, DWORD a1) {
+    if (!rtSSOn() || g_rtSS.dev != dev || !g_rtSS.rsOk) return false;
+    if (a0 > 255) return false;
+    if (g_rtSS.rs[a0] == a1) { g_rtSS.nSkip++; g_rtSS.nSkipRS++; return true; }
+    g_rtSS.rs[a0] = a1; return false;
+}
+static __forceinline void rtSSSetRS(DWORD dev, DWORD a0, DWORD a1) {
+    if (!rtSSOn()) return;
+    if (g_rtSS.dev != dev) { rtSSInvalidate(); g_rtSS.dev = dev; }
+    if (a0 > 255) { g_rtSS.rsOk = 0; return; }
+    g_rtSS.rs[a0] = a1; g_rtSS.rsOk = 1;
+}
+static __forceinline bool rtSSSkipSS(DWORD dev, DWORD a0, DWORD a1, DWORD a2) {
+    if (!rtSSOn() || g_rtSS.dev != dev || a0 > 7 || a1 > 31) return false;
+    DWORD k = (a0 << 5) | a1;
+    if (!(g_rtSS.ssOk[a0] & (1u << a1))) return false;
+    if (g_rtSS.ss[k] == a2) { g_rtSS.nSkip++; g_rtSS.nSkipSS++; return true; }
+    g_rtSS.ss[k] = a2; return false;
+}
+static __forceinline void rtSSSetSS(DWORD dev, DWORD a0, DWORD a1, DWORD a2) {
+    if (!rtSSOn()) return;
+    if (g_rtSS.dev != dev) { rtSSInvalidate(); g_rtSS.dev = dev; }
+    if (a0 > 7 || a1 > 31) { return; }
+    g_rtSS.ss[(a0 << 5) | a1] = a2; g_rtSS.ssOk[a0] |= 1u << a1;
+}
+static __forceinline bool rtSSSkipTSS(DWORD dev, DWORD a0, DWORD a1, DWORD a2) {
+    if (!rtSSOn() || g_rtSS.dev != dev || a0 > 7 || a1 > 31) return false;
+    DWORD k = (a0 << 5) | a1;
+    if (!(g_rtSS.tssOk[a0] & (1u << a1))) return false;
+    if (g_rtSS.tss[k] == a2) { g_rtSS.nSkip++; g_rtSS.nSkipTSS++; return true; }
+    g_rtSS.tss[k] = a2; return false;
+}
+static __forceinline void rtSSSetTSS(DWORD dev, DWORD a0, DWORD a1, DWORD a2) {
+    if (!rtSSOn()) return;
+    if (g_rtSS.dev != dev) { rtSSInvalidate(); g_rtSS.dev = dev; }
+    if (a0 > 7 || a1 > 31) { return; }
+    g_rtSS.tss[(a0 << 5) | a1] = a2; g_rtSS.tssOk[a0] |= 1u << a1;
+}
+static __forceinline bool rtSSSkipTex(DWORD dev, DWORD a0, DWORD a1) {
+    if (!rtSSOn() || g_rtSS.dev != dev || a0 > 7 || !(g_rtSS.texOk & (1u << a0))) return false;
+    if (g_rtSS.tex[a0] == a1) { g_rtSS.nSkip++; g_rtSS.nSkipTex++; return true; }
+    g_rtSS.tex[a0] = a1; return false;
+}
+static __forceinline void rtSSSetTex(DWORD dev, DWORD a0, DWORD a1) {
+    if (!rtSSOn()) return;
+    if (g_rtSS.dev != dev) { rtSSInvalidate(); g_rtSS.dev = dev; }
+    if (a0 > 7) { g_rtSS.texOk = 0; return; }
+    // a texture slot cannot be trusted when the texture is not one the device holds: textures created (the queue
+    // returns them) invalidate nothing, but a released texture does - the release path calls rtSSForgetTex
+    g_rtSS.tex[a0] = a1; g_rtSS.texOk |= 1u << a0;
+}
+static void rtSSForgetTex(DWORD tex);                 // a released texture: its slots are no longer what the device holds
+static __forceinline bool rtSSSkipTF(DWORD dev, DWORD a0, const DWORD* m) {
+    if (!rtSSOn() || g_rtSS.dev != dev || a0 > 511 || !g_rtSS.tfOk) return false;
+    const DWORD* have = g_rtSS.tf[a0];
+    if (have[0] == m[0] && memcmp(have, m, 64) == 0) { g_rtSS.nSkip++; g_rtSS.nSkipTF++; return true; }
+    return false;
+}
+static __forceinline void rtSSSetTF(DWORD dev, DWORD a0, const DWORD* m) {
+    if (!rtSSOn()) return;
+    if (g_rtSS.dev != dev) { rtSSInvalidate(); g_rtSS.dev = dev; }
+    if (a0 > 511) { g_rtSS.tfOk = 0; return; }
+    memcpy(g_rtSS.tf[a0], m, 64); g_rtSS.tfOk = 1;
+}
+static __forceinline bool rtSSSkipMtl(DWORD dev, const DWORD* m) {
+    if (!rtSSOn() || g_rtSS.dev != dev || !g_rtSS.mtlOk) return false;
+    if (memcmp(g_rtSS.mtl, m, 68) == 0) { g_rtSS.nSkip++; g_rtSS.nSkipMtl++; return true; }
+    return false;
+}
+static __forceinline void rtSSSetMtl(DWORD dev, const DWORD* m) {
+    if (!rtSSOn()) return;
+    if (g_rtSS.dev != dev) { rtSSInvalidate(); g_rtSS.dev = dev; }
+    memcpy(g_rtSS.mtl, m, 68); g_rtSS.mtlOk = 1;
+}
+static __forceinline bool rtSSSkipVP(DWORD dev, const DWORD* v) {
+    if (!rtSSOn() || g_rtSS.dev != dev || !g_rtSS.vpOk) return false;
+    if (memcmp(g_rtSS.vp, v, 24) == 0) { g_rtSS.nSkip++; g_rtSS.nSkipVP++; return true; }
+    return false;
+}
+static __forceinline void rtSSSetVP(DWORD dev, const DWORD* v) {
+    if (!rtSSOn()) return;
+    if (g_rtSS.dev != dev) { rtSSInvalidate(); g_rtSS.dev = dev; }
+    memcpy(g_rtSS.vp, v, 24); g_rtSS.vpOk = 1;
+}
+static __forceinline bool rtSSSkipFVF(DWORD dev, DWORD a0) {
+    if (!rtSSOn() || g_rtSS.dev != dev || !g_rtSS.fvfOk) return false;
+    if (g_rtSS.fvf == a0) { g_rtSS.nSkip++; g_rtSS.nSkipFVF++; return true; }
+    return false;
+}
+static __forceinline void rtSSSetFVF(DWORD dev, DWORD a0) {
+    if (!rtSSOn()) return;
+    if (g_rtSS.dev != dev) { rtSSInvalidate(); g_rtSS.dev = dev; }
+    g_rtSS.fvf = a0; g_rtSS.fvfOk = 1;
+    rtDsInvalDecl();                                   // SetFVF clears the vertex declaration, and the reverse
+}
+static void rtSSForgetTex(DWORD tex) {                 // one texture released: every slot holding it is void
+    if (!g_rtSS.on || !g_rtSS.texOk) return;
+    for (int i = 0; i < 8; ++i) if ((g_rtSS.texOk & (1u << i)) && g_rtSS.tex[i] == tex) g_rtSS.texOk &= ~(1u << i);
+}
+
+// ---------------------------------------------------------------- v29: the de-dupe on the CORE path
+// In CORE mode the generated setter runs here, on the game thread, in the engine's own order - so before making
+// the call it can ask whether the device already holds exactly this value, and skip the call when it does. That is
+// the same question rtDedupeDrop asks for the queue, and it uses the same shadow; the only difference is that
+// there is no queue to be "ahead of", so the answer is exact rather than queue-ordered.
+// Each returns true = the value is already set, the caller must not make the call.
+static LONG g_rtNCallSkip = 0, g_rtNCallKept = 0;         // the same pair the FULL path keeps, so one report line covers both
+static __forceinline bool rtCoreRS(DWORD dev, DWORD a0, DWORD a1) {
+    if (!rtSSOn() || g_rtSS.dev != dev || !g_rtSS.rsOk || a0 > 255) return false;   // unknown: make the call and learn
+    if (g_rtSS.rs[a0] == a1) { g_rtSS.nSkip++; g_rtSS.nSkipRS++; g_rtNCallSkip++; return true; }
+    g_rtSS.rs[a0] = a1; g_rtNCallKept++; return false;
+}
+static __forceinline bool rtCoreSS(DWORD dev, DWORD a0, DWORD a1, DWORD a2) {
+    if (!rtSSOn() || g_rtSS.dev != dev || a0 > 7 || a1 > 31) return false;
+    DWORD k = (a0 << 5) | a1;
+    if (!(g_rtSS.ssOk[a0] & (1u << a1))) { g_rtSS.ss[k] = a2; g_rtSS.ssOk[a0] |= 1u << a1; g_rtNCallKept++; return false; }
+    if (g_rtSS.ss[k] == a2) { g_rtSS.nSkip++; g_rtSS.nSkipSS++; g_rtNCallSkip++; return true; }
+    g_rtSS.ss[k] = a2; g_rtNCallKept++; return false;
+}
+static __forceinline bool rtCoreTSS(DWORD dev, DWORD a0, DWORD a1, DWORD a2) {
+    if (!rtSSOn() || g_rtSS.dev != dev || a0 > 7 || a1 > 31) return false;
+    DWORD k = (a0 << 5) | a1;
+    if (!(g_rtSS.tssOk[a0] & (1u << a1))) { g_rtSS.tss[k] = a2; g_rtSS.tssOk[a0] |= 1u << a1; g_rtNCallKept++; return false; }
+    if (g_rtSS.tss[k] == a2) { g_rtSS.nSkip++; g_rtSS.nSkipTSS++; g_rtNCallSkip++; return true; }
+    g_rtSS.tss[k] = a2; g_rtNCallKept++; return false;
+}
+static __forceinline bool rtCoreTex(DWORD dev, DWORD a0, DWORD a1) {
+    if (!rtSSOn() || g_rtSS.dev != dev || a0 > 7) return false;
+    if ((g_rtSS.texOk & (1u << a0)) && g_rtSS.tex[a0] == a1) { g_rtSS.nSkip++; g_rtSS.nSkipTex++; g_rtNCallSkip++; return true; }
+    g_rtSS.tex[a0] = a1; g_rtSS.texOk |= 1u << a0; g_rtNCallKept++; return false;
+}
+static __forceinline bool rtCoreTF(DWORD dev, DWORD a0, const DWORD* m) {    // m is the live matrix the engine passed
+    if (!m || !rtSSOn() || g_rtSS.dev != dev || a0 >= 512) return false;
+    if (g_rtSS.tfOk && !memcmp(g_rtSS.tf[a0], m, 64)) { g_rtSS.nSkip++; g_rtSS.nSkipTF++; g_rtNCallSkip++; return true; }
+    memcpy(g_rtSS.tf[a0], m, 64); g_rtSS.tfOk = 1; g_rtNCallKept++; return false;
+}
+static __forceinline bool rtCoreMtl(DWORD dev, const DWORD* m) {
+    if (!m || !rtSSOn() || g_rtSS.dev != dev) return false;
+    if (g_rtSS.mtlOk && !memcmp(g_rtSS.mtl, m, 68)) { g_rtSS.nSkip++; g_rtSS.nSkipMtl++; g_rtNCallSkip++; return true; }
+    memcpy(g_rtSS.mtl, m, 68); g_rtSS.mtlOk = 1; g_rtNCallKept++; return false;
+}
+static __forceinline bool rtCoreVP(DWORD dev, const DWORD* v) {
+    if (!v || !rtSSOn() || g_rtSS.dev != dev) return false;
+    if (g_rtSS.vpOk && !memcmp(g_rtSS.vp, v, 24)) { g_rtSS.nSkip++; g_rtSS.nSkipVP++; g_rtNCallSkip++; return true; }
+    memcpy(g_rtSS.vp, v, 24); g_rtSS.vpOk = 1; g_rtNCallKept++; return false;
+}
+static __forceinline bool rtCoreFVF(DWORD dev, DWORD a0) {
+    if (!rtSSOn() || g_rtSS.dev != dev || !g_rtSS.fvfOk) return false;
+    if (g_rtSS.fvf == a0) { g_rtSS.nSkip++; g_rtSS.nSkipFVF++; g_rtNCallSkip++; return true; }
+    g_rtSS.fvf = a0; g_rtNCallKept++; return false;
+}
+
+// ---------------------------------------------------------------- the eight plain state setters (v28)
+// Called from rtCommit before the record is numbered and published. Each one answers: does the DEVICE (in queue
+// order) already hold exactly what this record would set? If so the record is dropped - it is not numbered, not
+// published, and the ring space it took is handed straight back to the next rtAlloc. Any object reference the
+// record was holding is given back here, exactly as the worker would have given it back after running it.
+//
+// Only the queue path reaches here (the direct path never queues), and only for the eight setters listed in the
+// test-9 measurement. Everything else - and everything that could change these values behind the queue's back -
+// is handled by rtSSInvalidate from the callers that know (Reset, state blocks, off-queue calls).
+static void rtSSDropObj(RtRec* r) {                       // the AddRef rtObj made, given back exactly as rtExec's tail does
+    if (!r->objMask) return;
+    DWORD* a = rtArgs(r);
+    for (int i = 0; i < r->nargs; ++i)
+        if (((r->objMask >> i) & 1) && a[i]) ((DWORD(__stdcall*)(DWORD))(*(DWORD**)(ULONG_PTR)a[i])[2])(a[i]);
+    r->objMask = 0;
+}
+static bool rtDedupeDrop(RtRec* r) {
+    DWORD* a = rtArgs(r);
+    if (r->op == 202) { rtSSForgetTex(a[0]); return false; }   // a texture released: the slots holding it are void (see rtSSForgetTex)
+    if (r->op == 375) {                                    // StateBlock::Apply can put ANY device state back to a value the
+        g_rtSSApplySeq = g_rtSeq + 1;                      // queue did not set, and it runs at its own place in the queue:
+        rtSSInvalidate(); rtSSInvalidReason(2);            // the shadow describes the device again only once the worker has
+        return false;                                      // passed this record (see rtSSOn / rtSSApplySeq)
+    }
+    if (!rtSSOn()) return false;
+    DWORD dev = a[0];
+    bool skip = false;
+    switch (r->op) {
+    case 57:  skip = rtSSSkipRS(dev, a[1], a[2]); if (!skip) rtSSSetRS(dev, a[1], a[2]); break;              // SetRenderState
+    case 69:  skip = rtSSSkipSS(dev, a[1], a[2], a[3]); if (!skip) rtSSSetSS(dev, a[1], a[2], a[3]); break;  // SetSamplerState
+    case 67:  skip = rtSSSkipTSS(dev, a[1], a[2], a[3]); if (!skip) rtSSSetTSS(dev, a[1], a[2], a[3]); break;// SetTextureStageState
+    case 65:  skip = rtSSSkipTex(dev, a[1], a[2]); if (!skip) rtSSSetTex(dev, a[1], a[2]); break;            // SetTexture
+    case 44:  if (!a[2]) return false;                    // SetTransform: no matrix pointer, nothing to compare (payload is the copy)
+                  skip = rtSSSkipTF(dev, a[1], (const DWORD*)rtPayload(r));
+                  if (!skip) rtSSSetTF(dev, a[1], (const DWORD*)rtPayload(r)); break;
+    case 49:  if (!a[1]) return false;                    // SetMaterial
+                  skip = rtSSSkipMtl(dev, (const DWORD*)rtPayload(r)); if (!skip) rtSSSetMtl(dev, (const DWORD*)rtPayload(r)); break;
+    case 47:  if (!a[1]) return false;                    // SetViewport
+                  skip = rtSSSkipVP(dev, (const DWORD*)rtPayload(r)); if (!skip) rtSSSetVP(dev, (const DWORD*)rtPayload(r)); break;
+    case 89:  skip = rtSSSkipFVF(dev, a[1]); if (!skip) rtSSSetFVF(dev, a[1]); break;                        // SetFVF
+    default:  return false;
+    }
+    if (!skip) { g_rtNCallKept++; return false; }
+    // dropped: give back what the record was holding and let the ring space go to the next call
+    rtSSDropObj(r);
+    g_rtNCallSkip++;
+    return true;
+}
+static __forceinline void rtCommit(RtRec* r, DWORD po) {
+    if (g_capOn) capRecord(r, po);
+    if (g_rtSS.on && rtDedupeDrop(r)) { r->size = 0; return; }   // the record never existed: seq, head and publish are not touched
+    r->size = rtAl16((DWORD)(rtPayload(r) - (BYTE*)r) + po);
+    r->seq = ++g_rtSeq;
+    g_rtLocalHead = (DWORD)((BYTE*)r - g_rtBuf) + r->size;
+    PSTAT(g_rtNAsync++; g_rtBytes += r->size; g_rtOpN[r->op & 511]++);
+    if (++g_rtPH.unpublished >= 32 || (r->flags & 1)) rtPublish();   // Present publishes immediately
+}
+static void rtFxClose() {
+    RtRec* r = g_rtFxRec; g_rtFxRec = NULL;
+    DWORD n = g_rtFxN;
+    r->pad = n;                                          // entry count for the worker
+    rtCommit(r, g_rtFxPos);
+    if (n > 1) {                                         // statistics and the publish cadence stay in calls, not records
+        PSTAT(g_rtNAsync += (LONG)(n - 1));
+        g_rtPH.unpublished += n - 1;
+        if (g_rtPH.unpublished >= 32) rtPublish();
+    }
+    PSTAT(g_rtNFxBatch++; g_rtNFxEntry += (LONG)n;
+          for (int k = 0; k < 8; ++k) if (g_rtFx.opN[k]) { g_rtOpN[kRtFxOp[k]] += g_rtFx.opN[k]; g_rtFx.opN[k] = 0; });
+}
+// Waiting for the queue: until the record with sequence number `target` has run - and with it everything queued
+// before it. rtDrain waits for the newest record there is. A caller that needs ONE object's queued records gone
+// (rtRefPending says which is the newest of those) waits for that one only: what is queued behind it, a frame's
+// draws or another texture still being decoded, has nothing to do with the object.
+static volatile LONG g_rtNDrainTo = 0;
+static void rtDrainTo(DWORD target);
+static void rtDrain() {
+    if (g_rtFxRec) rtFxClose();                          // the drain target has to include the open batch
+    if (g_rtPxRec) rtPxClose();
+    rtDrainTo(g_rtSeq);
+}
+static volatile LONG g_rtNDrainHeld = 0;                 // waits for the queue asked for by the holder of the render lock (not waited for)
+static const char* rtOpName(int op);
+static void rtDrainTo(DWORD target) {
+    if (g_rtFxRec) rtFxClose();                          // an open batch gets the next number: the target may be it
+    if (g_rtPxRec) rtPxClose();
+    if (rtSeqReached(g_rtExecSeq, target)) { g_rtCurOp = 511; return; }
+    // The render thread needs the render lock to run a single record, so a thread that holds it would wait here for
+    // ever. Direct work under the lock raises g_rtDirectScope and then no hook comes here - but a slip is a hang
+    // (twOnReset, v60 to v65), and the way in is not ours to close: DXVK calls hooked methods from inside its own.
+    // The holder of the lock has the device to itself, so the call that asked simply runs.
+    if ((DWORD)(ULONG_PTR)g_rtExecCs.OwningThread == GetCurrentThreadId()) {
+        if (InterlockedIncrement(&g_rtNDrainHeld) == 1)
+            logf("rt: a wait for the queue was asked for by the thread that holds the render lock (%s, %u records queued) - not waited for, the call runs at once. Please report this line.", rtOpName(g_rtCurOp & 511), target - g_rtExecSeq);
+        g_rtCurOp = 511; return;
+    }
+    rtPublish();
+    LONG64 t0 = qpcNow(), tx0 = g_txjRtWaitTicks;
+    g_rtDrains++;
+    g_rtDrainSeq = target;
+    InterlockedExchange(&g_rtDrainWaiting, 1);
+    if (g_rtWorkerSleeping) SetEvent(g_rtWake);
+    int spins = 0; bool warned = false, pump = false;
+    RtStuck st; rtStuckBegin(st);
+    while (!rtSeqReached(g_rtExecSeq, target)) {
+        if (++spins < 8192) { _mm_pause(); continue; }
+        if (!pump && rtStuckNow(st)) {                       // the render thread stands still: it may be waiting for this thread to answer a window message
+            pump = true;
+            if (InterlockedIncrement(&g_rtNPumpStuck) <= 5)
+                logf("rt: the render thread has not finished a record for a tenth of a second while the game thread waits for it (%s%s) - window messages sent to the game are let through from here on in this wait.",
+                     !g_rtDg.on ? "what it is in is not tracked" : g_rtDg.kind == 0xFF ? "between records" : "in ", (g_rtDg.on && g_rtDg.kind != 0xFF) ? rtOpName(g_rtDg.op) : "");
+        }
+        InterlockedExchange(&g_rtMainSleeping, 1);
+        if (!rtSeqReached(g_rtExecSeq, target)) rtWaitH(g_rtDrained, 1, pump);
+        InterlockedExchange(&g_rtMainSleeping, 0);
+        if (!warned && (spins & 1023) == 0 && qpcNow() - t0 > g_pqpf.QuadPart * 5) {
+            warned = true;
+            RtRec* cur = (RtRec*)(g_rtBuf + g_rtTail);
+            DWORD own = (DWORD)(ULONG_PTR)g_rtExecCs.OwningThread;
+            logf("rt: WARNING game thread waited > 5 s for the worker (exec seq %u, target %u, next op %s) | render lock held by %s | render thread %s, %s%s | lock wanted %d, frame held %d, pictures waiting %d, direct scope %d",
+                 g_rtExecSeq, target, rtOpName(cur->op), !own ? "nobody" : own == g_rtWorkerTid ? "the render thread" : own == g_rtMainTid ? "the game thread" : "another thread",
+                 g_rtWorkerSleeping ? "asleep" : "awake", !g_rtDg.on ? "what it is in is not tracked" : g_rtDg.kind == 0xFF ? "between records" : "in ", (g_rtDg.on && g_rtDg.kind != 0xFF) ? rtOpName(g_rtDg.op) : "",
+                 (int)g_rtLK.want, (int)g_twHold, (int)g_twBusy, (int)g_rtDirectScope);
+        }
+    }
+    InterlockedExchange(&g_rtDrainWaiting, 0);
+    LONG64 dt = qpcNow() - t0;
+    g_rtDrainTicks += dt; g_rtDrainOpTicks[g_rtCurOp & 511] += dt; g_rtCurOp = 511;
+    InterlockedExchange(&g_rtNWaitCalls, g_rtNWaitCalls + 1);
+    // the worst single wait of the window and what it was waiting on: the whole point of the escalation is to know
+    // WHICH wait froze a frame, not that a frame froze (v28, requirement 4)
+    LONG ms1 = (LONG)(dt * 1000 / (g_pqpf.QuadPart ? g_pqpf.QuadPart : 1));
+    if (ms1 > g_rtWaitMaxMs) {
+        RtRec* cur = (RtRec*)(g_rtBuf + g_rtTail);
+        g_rtWaitMaxMs = ms1;
+        g_rtWaitMaxBehind = (LONG)(target - g_rtExecSeq);
+        g_rtWaitMaxOp = cur->op;
+    }
+    if (ms1 > g_rtProdWaitMax) g_rtProdWaitMax = ms1;
+    // v32: the freeze guard decides HERE, at the wait itself. (Before, it was decided in rtReport, which the product
+    // build never starts - and which cleared the worst-wait counter before the check read it - so it could never fire.)
+    // v33: the time the worker itself spent waiting for texture decoding threads (which were working) is not a freeze
+    LONG msG = ms1 - (LONG)((g_txjRtWaitTicks - tx0) * 1000 / (g_pqpf.QuadPart ? g_pqpf.QuadPart : 1));
+    LONG lim = rtBypLimitMs();                                // v34: 2500 ms while a map loads (no logic step for 3 s), 250 ms in play
+    if (g_rtBypassOn && lim > 0 && msG >= lim && !g_rtBypassFired && g_rtActive) {
+        char why[160];
+        wsprintfA(why, "wait for the render worker: the game thread waited %d ms in one go (the limit is %d ms %s)", (int)ms1, (int)lim, lim == g_rtBypWaitLoadMs ? "while loading - no logic step for 3 s" : "in play");
+        rtBypassEngage(why, "measured at the wait itself");
+    }
+}
+static __forceinline bool rtIsName(DWORD h) { return h != 0 && (h & 0x80000003u) != 0x80000003u; }
+static DWORD rtStrBytes(DWORD s) {
+    if (!s) return 0;
+    __try { return (DWORD)strlen((const char*)(ULONG_PTR)s) + 1; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static __forceinline DWORD rtHandleBytes(DWORD h) { return rtIsName(h) ? rtStrBytes(h) : 0; }
+static __forceinline DWORD rtBytes(BYTE* P, DWORD* po, DWORD ptr, DWORD n) {
+    if (!ptr) return 0;
+    DWORD at = rtAl16(*po);
+    if (n) memcpy(P + at, (const void*)(ULONG_PTR)ptr, n);
+    *po = at + n;
+    return (DWORD)(ULONG_PTR)(P + at);
+}
+static DWORD rtStr(BYTE* P, DWORD* po, DWORD s) { return s ? rtBytes(P, po, s, rtStrBytes(s)) : 0; }
+static DWORD rtHandle(BYTE* P, DWORD* po, DWORD h) { return rtIsName(h) ? rtStr(P, po, h) : h; }
+// ---------------------------------------------------------------- locks of textures the queue cannot know yet
+// A texture created while the render thread is live starts out named by nothing: no queued call mentions it, so no
+// queued draw can sample it (a draw samples a texture only through SetTexture or an effect's texture parameter, and
+// both name the object when they are queued). Until the first queued call names it, its system-memory copy can be
+// locked and filled at once - the usual case of a texture that is created and then filled - instead of waiting for
+// the whole queue. The registry is dropped on Release and on device reset, and any naming removes the texture.
+#define RT_FRESH_N 256
+static DWORD g_rtFresh[RT_FRESH_N];
+static LONG g_rtFreshN = 0, g_rtFreshOn = 1;
+static BYTE g_rtFreshMark[RT_REFN];
+static volatile LONG g_rtNFreshLock = 0, g_rtNFreshMiss = 0, g_rtNFreshAdd = 0;
+static void rtFreshAdd(DWORD obj) {
+    if (!obj || !g_rtFreshOn) return;
+    if (g_rtFreshN >= RT_FRESH_N) { g_rtFreshMark[rtRefIdx(g_rtFresh[0])] = 0; memmove(g_rtFresh, g_rtFresh + 1, (RT_FRESH_N - 1) * sizeof(DWORD)); g_rtFreshN = RT_FRESH_N - 1;
+                                    for (LONG i = 0; i < g_rtFreshN; ++i) g_rtFreshMark[rtRefIdx(g_rtFresh[i])] = 1; }
+    g_rtFresh[g_rtFreshN++] = obj; g_rtFreshMark[rtRefIdx(obj)] = 1; g_rtNFreshAdd++;
+}
+static void rtFreshDropSlow(DWORD obj) {
+    for (LONG i = 0; i < g_rtFreshN; ++i) if (g_rtFresh[i] == obj) { g_rtFresh[i] = g_rtFresh[--g_rtFreshN]; break; }
+    DWORD idx = rtRefIdx(obj);
+    for (LONG i = 0; i < g_rtFreshN; ++i) if (rtRefIdx(g_rtFresh[i]) == idx) return;
+    g_rtFreshMark[idx] = 0;
+}
+static __forceinline void rtFreshName(DWORD obj) { if (g_rtFreshN && g_rtFreshMark[rtRefIdx(obj)]) rtFreshDropSlow(obj); }
+static __forceinline bool rtFreshHas(DWORD obj) {
+    if (!obj || !g_rtFreshN || !g_rtFreshMark[rtRefIdx(obj)]) return false;
+    for (LONG i = 0; i < g_rtFreshN; ++i) if (g_rtFresh[i] == obj) return true;
+    return false;
+}
+static void rtFreshForget() { for (LONG i = 0; i < g_rtFreshN; ++i) g_rtFreshMark[rtRefIdx(g_rtFresh[i])] = 0; g_rtFreshN = 0; }
+
+// ---------------------------------------------------------------- vertex and index buffers the queue cannot know yet
+// The same for buffers. A static mesh, a terrain patch, a road: the engine creates the buffer, locks it once with
+// no flags, fills it, unlocks it and binds it some time later. A lock with no flags may read, so it used to go
+// through a mirror, and adopting a buffer into a mirror drained the whole queue - for a buffer that had existed
+// for microseconds. In a load that is one drain per buffer, thousands of them (the 2026-10-07 save-load profile:
+// a third of the load was the game thread waiting inside this lock while the render thread waited for textures).
+// A buffer created through the hooks on the game thread and not yet bound by a queued SetStreamSource / SetIndices
+// is used by no queued draw (the engine binds before every draw), so its lock and unlock run at once under the
+// exec lock, on the real buffer, with no mirror and no copy. The first binding, a Release, a device reset or a
+// render thread switch takes it out of the set. Game thread only.
+#define RT_FB_CAP  8192u
+#define RT_FB_HASH 32768u
+static DWORD g_rtFBTab[RT_FB_HASH];                      // 0 empty, 1 was used, otherwise the buffer
+static DWORD g_rtFBRing[RT_FB_CAP]; static DWORD g_rtFBHead = 0, g_rtFBTail = 0;       // the order they came in, for letting the oldest go
+static LONG g_rtFBN = 0, g_rtFBUsed = 0, g_rtFBOn = 1;
+static volatile LONG g_rtNFBAdd = 0, g_rtNFBLock = 0, g_rtNFBOld = 0;
+static __forceinline DWORD rtFBIdx(DWORD o) { return ((o >> 3) * 2654435761u) >> 17; }
+static bool rtFBHas(DWORD o) {
+    for (DWORD i = rtFBIdx(o), k = 0; k < RT_FB_HASH; ++k, i = (i + 1) & (RT_FB_HASH - 1)) { DWORD v = g_rtFBTab[i]; if (v == o) return true; if (!v) return false; }
+    return false;
+}
+static void rtFBForget() { if (g_rtFBUsed) memset(g_rtFBTab, 0, sizeof(g_rtFBTab)); g_rtFBN = 0; g_rtFBUsed = 0; g_rtFBHead = g_rtFBTail = 0; }
+static void rtFBDrop(DWORD o) {
+    for (DWORD i = rtFBIdx(o), k = 0; k < RT_FB_HASH; ++k, i = (i + 1) & (RT_FB_HASH - 1)) {
+        DWORD v = g_rtFBTab[i];
+        if (!v) return;
+        if (v == o) { g_rtFBTab[i] = 1; if (--g_rtFBN == 0) rtFBForget(); return; }
+    }
+}
+static void rtFBAdd(DWORD o) {
+    if (o < 0x10000 || rtFBHas(o)) return;
+    if (g_rtFBHead - g_rtFBTail >= RT_FB_CAP) g_rtFBTail = g_rtFBHead - RT_FB_CAP + 1;                  // the ring keeps the last CAP additions
+    while (g_rtFBN >= (LONG)RT_FB_CAP - 1 && g_rtFBTail != g_rtFBHead) { DWORD old = g_rtFBRing[g_rtFBTail++ & (RT_FB_CAP - 1)]; if (rtFBHas(old)) { rtFBDrop(old); g_rtNFBOld++; } }
+    if (g_rtFBN >= (LONG)RT_FB_CAP - 1) rtFBForget();                                                    // nothing left to let go one by one: start over (they only lose the short cut)
+    if (g_rtFBUsed >= (LONG)(RT_FB_HASH / 2)) {          // too many used slots: start the table over with what is still in it
+        static DWORD keep[RT_FB_CAP]; DWORD n = 0;
+        for (DWORD i = 0; i < RT_FB_HASH && n < RT_FB_CAP; ++i) if (g_rtFBTab[i] > 1) keep[n++] = g_rtFBTab[i];
+        memset(g_rtFBTab, 0, sizeof(g_rtFBTab)); g_rtFBUsed = 0; g_rtFBN = 0;
+        for (DWORD q = 0; q < n; ++q) { DWORD i = rtFBIdx(keep[q]); while (g_rtFBTab[i]) i = (i + 1) & (RT_FB_HASH - 1); g_rtFBTab[i] = keep[q]; g_rtFBUsed++; g_rtFBN++; }
+    }
+    DWORD i = rtFBIdx(o);
+    while (g_rtFBTab[i] > 1) i = (i + 1) & (RT_FB_HASH - 1);
+    if (!g_rtFBTab[i]) g_rtFBUsed++;
+    g_rtFBTab[i] = o; g_rtFBN++;
+    g_rtFBRing[g_rtFBHead++ & (RT_FB_CAP - 1)] = o;
+    g_rtNFBAdd++;
+}
+static __forceinline void rtFBName(DWORD o) { if (g_rtFBN && o) rtFBDrop(o); }
+// A buffer filled at once is not in the queue, so a second pass over the frame (in-between frames) could not put
+// that first content back if the buffer were written again later in the same frame. So while a marked stretch is
+// open and still meant to be run again, a new buffer's write lock is not served at once: the buffer leaves this
+// set and goes the recorded way (rtBufLock: mirror, staged bytes, one record) - which no longer waits for the queue
+// either, because nothing queued can be pending on a buffer nothing has named. (v52 filled it at once all the same
+// and kept a list of 64 such buffers per frame to catch a second write. A camera pan creates more new terrain
+// buffers than that in a frame: the list overflowed, and from then on ANY buffer write cancelled the frame's
+// in-between picture - one frame in five during a pan, 2026-10-07.)
+static volatile LONG g_rtNFBStretch = 0;                 // new buffers that went the recorded way because their frame is drawn twice
+static volatile LONG g_rtNBeginDesc = 0;                 // first Begin of a technique answered from its description, without waiting for the queue
+static void rtFBRelease(void* self) { if (g_rtFBN && __readfsdword(0x24) == g_rtMainTid) rtFBDrop((DWORD)(ULONG_PTR)self); }
+
+// The "newest queued record naming this object" table is consulted for two kinds of object only: surfaces and
+// textures about to be locked. Vertex buffers, index buffers, vertex declarations and shaders were stamped into the
+// same 16k-slot hash on every SetStreamSource / SetIndices / SetVertexDeclaration / Set*Shader (~30k times a frame),
+// which did nothing useful and made unrelated surfaces look busy: the v22 log shows 64x64 system-memory surfaces
+// "named by SetStreamSource", each such false hit a ~2 ms wait for the whole queue. Those ops no longer stamp.
+static BYTE g_rtOpNoTouch[512];                          // 1: this op's object arguments are never a texture or a surface
+static void rtOpNoTouchInit() { g_rtOpNoTouch[87] = g_rtOpNoTouch[92] = g_rtOpNoTouch[100] = g_rtOpNoTouch[104] = g_rtOpNoTouch[107] = 1; }   // SetVertexDeclaration, SetVertexShader, SetStreamSource, SetIndices, SetPixelShader
+static __forceinline DWORD rtObj(RtRec* r, int argIndex, DWORD obj) {
+    if (obj && !g_rtOpNoTouch[r->op & 511]) { rtTouch(obj, (WORD)r->op); g_rtRefOp[rtRefIdx(obj)] = (WORD)r->op; rtFreshName(obj); }
+    if (obj && g_rtObjRefs) { ((DWORD(__stdcall*)(DWORD))(*(DWORD**)(ULONG_PTR)obj)[1])(obj); r->objMask |= (WORD)(1u << argIndex); }
+    return obj;
+}
+static __forceinline DWORD rtObjKeepNew(RtRec* r, int argIndex, DWORD obj) {      // named and stamped as by rtObj, but a texture nothing else has named stays in the "new" set (aotr_texjobs.inc)
+    if (obj) { rtTouch(obj, (WORD)r->op); g_rtRefOp[rtRefIdx(obj)] = (WORD)r->op; }
+    if (obj && g_rtObjRefs) { ((DWORD(__stdcall*)(DWORD))(*(DWORD**)(ULONG_PTR)obj)[1])(obj); r->objMask |= (WORD)(1u << argIndex); }
+    return obj;
+}
+
+// Parameter blocks recorded through the queue get proxy handles. D3DX handles are the bitwise NOT of an object
+// pointer (d3dx9_27 SetFloat: (h & 0x80000003) == 0x80000003 -> ~h), and game.dat is large-address-aware, so a
+// real handle can take almost any value - except the NOT of an address in the first 64 KB, which Windows never
+// allocates. Proxies are 0xFFFF0003 | index << 2 (index 1..16383). The worker stores the real handle when
+// EndParameterBlock executes and translates in Apply/DeleteParameterBlock, all in queue order.
+#define RT_PBN (1u << 14)
+static DWORD* g_rtPBReal = NULL;
+static __forceinline bool rtIsPBProxy(DWORD h) { return (h & 0xFFFF0003u) == 0xFFFF0003u; }
+static __forceinline DWORD rtPBIndex(DWORD h) { return (h >> 2) & (RT_PBN - 1); }
+static __forceinline DWORD rtPBReal(DWORD h) { return (rtIsPBProxy(h) && g_rtPBReal) ? g_rtPBReal[rtPBIndex(h)] : h; }
+
+// ---------------------------------------------------------------- the device calls inside effect calls
+// While the render thread executes an effect call of a frame that will be drawn a second time, every device call
+// D3DX makes for it is kept here: method, arguments, constant data. The second pass issues those calls again
+// instead of asking D3DX a second time (aotr_devpass.inc has the why, the rules and the proof). Only the render
+// thread notes anything - the hooks ask for its thread id first - so the game thread never touches this line.
+// A call is one word (method | words << 16; state block methods are 0x100 | slot) followed by its arguments; a
+// constant upload carries its data. Anything D3DX does to the device that is not one of the methods below makes
+// the frame's recording unfit to stand in for D3DX (the first Begin of a technique records state blocks, for one).
+#define DV_A_BYTES (32u << 20)
+#define DV_X_BYTES (1u << 18)
+#define DV_CHUNKS  (1u << 16)
+enum { DV_BAD_FULL = 1, DV_BAD_CALL = 2, DV_BAD_STRAY = 4, DV_BAD_CHUNKS = 8 };
+struct DvChunk { RtRec* rec; DWORD off, bytes; };
+__declspec(align(64)) struct DvRec {
+    BYTE* cur; BYTE* end;                    // where the next call goes (NULL: nothing is listened to)
+    LONG  bad; DWORD badSlot;                // DV_BAD_*, and the method that said so
+    LONG  rec;                               // a stretch is open and its effect calls are kept
+    BYTE* a; DWORD usedA;                    // the first pass: the calls ...
+    DvChunk* chunk; LONG nChunk;             // ... and the effect call each run of them belongs to (the record's pad is its index + 1)
+    BYTE* x;                                 // one effect call of a second pass made by D3DX (verification)
+    BYTE* stray;                             // records that must not reach the device at all (parameter writes, parameter blocks)
+    const BYTE* rawPtr; DWORD rawBytes, rawOff;  // what SetRawValue was given last (in the stream; it stays there while the stretch is held)
+    DWORD curOp;                             // the effect call being listened to (0: none of the first pass)
+    DWORD curVs;                             // it has bound a vertex shader: what it uploads after that is every constant of the new shader in one call
+};
+static DvRec g_dvr;
+static volatile LONG g_dvOn = 0;             // the feature ([Engine] DevicePass)
+static __forceinline DWORD* dvRoom(DWORD words) {
+    BYTE* p = g_dvr.cur;
+    if ((DWORD)(g_dvr.end - p) < words * 4) { g_dvr.bad |= DV_BAD_FULL; return NULL; }
+    g_dvr.cur = p + words * 4;
+    return (DWORD*)p;
+}
+static void __stdcall dvNote1(DWORD slot, DWORD a0) { DWORD* p = dvRoom(2); if (p) { p[0] = slot | (2u << 16); p[1] = a0; } if (slot == 92) g_dvr.curVs = 1; }
+static void __stdcall dvNote2(DWORD slot, DWORD a0, DWORD a1) { DWORD* p = dvRoom(3); if (p) { p[0] = slot | (3u << 16); p[1] = a0; p[2] = a1; } }
+static void __stdcall dvNote3(DWORD slot, DWORD a0, DWORD a1, DWORD a2) { DWORD* p = dvRoom(4); if (p) { p[0] = slot | (4u << 16); p[1] = a0; p[2] = a1; p[3] = a2; } }
+static void __stdcall dvNoteC(DWORD slot, DWORD start, DWORD ptr, DWORD count, DWORD per) {      // a constant upload: per bytes a register
+    DvRec& d = g_dvr;
+    if (!ptr || !count || count > 1024) { d.bad |= DV_BAD_CALL; d.badSlot = slot; return; }
+    DWORD nb = count * per, words = 3 + ((nb + 3) >> 2);
+    // A CommitChanges uploading float constants that begin with the very bytes SetRawValue was just given - a mesh's
+    // joint palette, most of what D3DX uploads in a battle: kept as "those bytes of the stream" (0x200 | method:
+    // start, count, where, how many bytes), not copied. What the registers behind them held is not kept.
+    if (slot == 94 && d.curOp == 185 && !d.curVs && d.rawPtr && !d.rawOff && d.rawBytes && !(d.rawBytes & 15) && nb >= d.rawBytes && !memcmp((const void*)(ULONG_PTR)ptr, d.rawPtr, d.rawBytes)) {
+        DWORD* q = dvRoom(5);
+        if (q) { q[0] = (0x200u | 94u) | (5u << 16); q[1] = start; q[2] = count; q[3] = (DWORD)(ULONG_PTR)d.rawPtr; q[4] = d.rawBytes; }
+        return;
+    }
+    DWORD* p = dvRoom(words);
+    if (p) { p[0] = slot | (words << 16); p[1] = start; p[2] = count; memcpy(p + 3, (const void*)(ULONG_PTR)ptr, nb); }
+}
+static void __stdcall dvNoteBad(DWORD slot) { g_dvr.bad |= DV_BAD_CALL; g_dvr.badSlot = slot; }
+static __forceinline bool dvOpen(RtRec* r) {             // an effect call inside the stretch is about to execute
+    DvRec& d = g_dvr;
+    if (d.nChunk >= (LONG)DV_CHUNKS) { d.bad |= DV_BAD_CHUNKS; return false; }
+    DvChunk& c = d.chunk[d.nChunk];
+    c.rec = r; c.off = d.usedA; c.bytes = 0;
+    r->pad = (DWORD)d.nChunk + 1;
+    d.cur = d.a + d.usedA; d.end = d.a + DV_A_BYTES; d.curOp = r->op; d.curVs = 0;
+    return true;
+}
+static __forceinline void dvClose() {
+    DvRec& d = g_dvr;
+    DvChunk& c = d.chunk[d.nChunk++];
+    c.bytes = (DWORD)(d.cur - (d.a + c.off)); d.usedA += c.bytes; d.cur = NULL; d.curOp = 0;
+}
+static __forceinline void dvStrayOpen() { g_dvr.cur = g_dvr.stray; g_dvr.end = g_dvr.stray + 4096; }
+static __forceinline void dvStrayClose() { if (g_dvr.cur != g_dvr.stray) g_dvr.bad |= DV_BAD_STRAY; g_dvr.cur = NULL; }
+
+typedef DWORD (__stdcall* RtF1)(DWORD);
+typedef DWORD (__stdcall* RtF2)(DWORD, DWORD);
+typedef DWORD (__stdcall* RtF3)(DWORD, DWORD, DWORD);
+typedef DWORD (__stdcall* RtF4)(DWORD, DWORD, DWORD, DWORD);
+typedef DWORD (__stdcall* RtF5)(DWORD, DWORD, DWORD, DWORD, DWORD);
+typedef DWORD (__stdcall* RtF6)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+typedef DWORD (__stdcall* RtF7)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+typedef DWORD (__stdcall* RtF8)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+typedef DWORD (__stdcall* RtF9)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+typedef DWORD (__stdcall* RtF10)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+// v43: the render worker's longest single call in the current and in the last whole second (rdtsc ticks / 1024), for the
+// stall line: a frame the game thread spent mostly waiting may have waited for this (DXVK building a pipeline, a driver).
+static volatile LONG g_rtWCurMax = 0, g_rtWPrevMax = 0, g_rtWCurOp = 0, g_rtWPrevOp = 0; static DWORD g_rtWSec = 0;
+static __forceinline void rtWNote(DWORD k, WORD op) {
+    DWORD sec = GetTickCount() / 1000;
+    if (sec != g_rtWSec) { g_rtWSec = sec; g_rtWPrevMax = g_rtWCurMax; g_rtWPrevOp = g_rtWCurOp; g_rtWCurMax = 0; }
+    if ((LONG)k > g_rtWCurMax) { g_rtWCurMax = (LONG)k; g_rtWCurOp = op; }
+}
+static void rtExec(RtRec* r) {
+    DWORD* a = rtArgs(r);
+    if (g_rtDg.on) { g_rtDg.op = r->op; g_rtDg.kind = (BYTE)r->kind; }
+    if (r->kind == 4) {                                  // engine per-pixel write (SurfaceClass DrawPixel / alpha): Lock 1x1, write, Unlock
+        struct { LONG l, t, rr, b; } rc = { (LONG)a[1], (LONG)a[2], (LONG)a[1] + 1, (LONG)a[2] + 1 };
+        struct { INT pitch; void* bits; } lr = { 0, NULL };
+        ((DWORD(__stdcall*)(DWORD, void*, void*, DWORD))r->fn)(a[0], &lr, &rc, 0);
+        if (lr.bits) switch (a[4]) {
+            case 1: *(BYTE*)lr.bits = (BYTE)a[3]; break;
+            case 2: *(WORD*)lr.bits = (WORD)a[3]; break;
+            case 4: *(DWORD*)lr.bits = a[3]; break;
+            case 0x100: ((BYTE*)lr.bits)[3] = (BYTE)a[3]; break;
+        }
+        ((DWORD(__stdcall*)(DWORD))(ULONG_PTR)a[5])(a[0]);
+        return;
+    }
+    if (r->kind == 10) {                                 // v38: a run of engine per-pixel writes to one surface - each one exactly as kind 4
+        const DWORD* e = (const DWORD*)rtPayload(r);
+        for (DWORD i = 0; i < r->pad; ++i, e += 4) {
+            struct { LONG l, t, rr, b; } rc = { (LONG)e[0], (LONG)e[1], (LONG)e[0] + 1, (LONG)e[1] + 1 };
+            struct { INT pitch; void* bits; } lr = { 0, NULL };
+            ((DWORD(__stdcall*)(DWORD, void*, void*, DWORD))r->fn)(a[0], &lr, &rc, 0);
+            if (lr.bits) switch (e[3]) {
+                case 1: *(BYTE*)lr.bits = (BYTE)e[2]; break;
+                case 2: *(WORD*)lr.bits = (WORD)e[2]; break;
+                case 4: *(DWORD*)lr.bits = e[2]; break;
+                case 0x100: ((BYTE*)lr.bits)[3] = (BYTE)e[2]; break;
+            }
+            ((DWORD(__stdcall*)(DWORD))(ULONG_PTR)a[1])(a[0]);
+        }
+        return;
+    }
+    if (r->kind == 7) {                                  // staged full-rect write (engine shroud textures): LockRect(rect), copy rows, UnlockRect
+        struct { LONG l, t, rr, b; } rc = { (LONG)a[1], (LONG)a[2], (LONG)a[3], (LONG)a[4] };
+        struct { INT pitch; void* bits; } lr = { 0, NULL };
+        DWORD w = a[3] - a[1], hgt = a[4] - a[2], rowBytes = w * a[5];
+        ((DWORD(__stdcall*)(DWORD, void*, void*, DWORD))(ULONG_PTR)a[7])(a[0], &lr, &rc, 0x800);
+        if (lr.bits) for (DWORD y = 0; y < hgt; ++y) memcpy((BYTE*)lr.bits + (INT)y * lr.pitch, (BYTE*)(ULONG_PTR)a[6] + y * rowBytes, rowBytes);
+        ((DWORD(__stdcall*)(DWORD))(ULONG_PTR)a[8])(a[0]);
+        return;
+    }
+    if (r->kind == 5) { g_rtPBReal[a[1]] = ((RtF1)r->fn)(a[0]); return; }                       // EndParameterBlock -> proxy slot
+    if (r->kind == 6) {                                                                          // Apply/DeleteParameterBlock via proxy
+        DWORD real = g_rtPBReal[a[1]];
+        if (a[2]) {                                                                              // delete: the index is free for the next block now,
+            g_rtPBReal[a[1]] = 0;                                                                // the block itself may have to outlive a second pass
+            if (g_twStretch && twDefer(r->fn, a[0], real, 1)) return;
+        } else r->pad = real;                                                                    // apply: the handle this execution resolved (aotr_tween.inc)
+        if (g_dvr.rec) { dvStrayOpen(); ((RtF2)r->fn)(a[0], real); dvStrayClose(); return; }      // (a parameter block must not reach the device: aotr_devpass.inc)
+        ((RtF2)r->fn)(a[0], real);
+        return;
+    }
+    if (r->kind == 9) {                                  // UpdateSurface from a snapshot: rows -> private staging surface -> UpdateSurface
+        struct { LONG l, t, rr, b; } rc = { (LONG)a[2], (LONG)a[3], (LONG)a[4], (LONG)a[5] };
+        struct { INT pitch; void* bits; } lr = { 0, NULL };
+        DWORD w = a[4] - a[2], hgt = a[5] - a[3], rowBytes = w * a[6];
+        if ((LONG)((DWORD(__stdcall*)(DWORD, void*, void*, DWORD))(ULONG_PTR)a[12])(a[1], &lr, &rc, 0x800) >= 0) {
+            if (lr.bits) for (DWORD y = 0; y < hgt; ++y) memcpy((BYTE*)lr.bits + (INT)y * lr.pitch, (const BYTE*)(ULONG_PTR)a[7] + y * rowBytes, rowBytes);
+            ((DWORD(__stdcall*)(DWORD))(ULONG_PTR)a[13])(a[1]);
+        }
+        struct { LONG x, y; } pt = { (LONG)a[9], (LONG)a[10] };
+        ((DWORD(__stdcall*)(DWORD, DWORD, void*, DWORD, void*))(ULONG_PTR)a[14])(a[0], a[1], (a[11] & 1) ? (void*)&rc : NULL, a[8], (a[11] & 2) ? (void*)&pt : NULL);
+        return;
+    }
+    if (r->kind == 8) {                                  // a run of effect parameter writes (see rtFxRoom)
+        const DWORD* e = (const DWORD*)rtPayload(r);
+        void** O = (void**)r->fn;                          // the effect's original methods, put there by rtFxRoom
+        LONG listen = g_dvr.rec;                            // (parameter writes must not reach the device: aotr_devpass.inc)
+        if (listen) dvStrayOpen();
+        for (DWORD i = r->pad; i; --i) {
+            DWORD w0 = e[0], slot = w0 & 0xFF, nb = (w0 >> 8) & 0x7FFFFF;
+            if (slot == 78) {
+                ((RtF5)O[78])(e[1], e[2], (w0 & 0x80000000u) ? (DWORD)(ULONG_PTR)(e + 5) : 0, e[3], e[4]);
+                if (listen) { g_dvr.rawPtr = (w0 & 0x80000000u) ? (const BYTE*)(e + 5) : NULL; g_dvr.rawBytes = e[4]; g_dvr.rawOff = e[3]; }
+                e = (const DWORD*)((const BYTE*)e + 20 + ((nb + 3) & ~3u));
+            } else if (slot == 34 || slot == 38 || slot == 44) {
+                ((RtF3)O[slot])(e[1], e[2], (w0 & 0x80000000u) ? (DWORD)(ULONG_PTR)(e + 3) : 0);
+                e = (const DWORD*)((const BYTE*)e + 12 + ((nb + 3) & ~3u));
+            } else if (slot == 0xF0) {
+                e += 1 + ((w0 >> 8) & 0xFFFF);            // which meshes the next draw is (aotr_tween.inc): nothing to execute
+            } else {
+                ((RtF3)O[slot])(e[1], e[2], e[3]);
+                e += 4;
+            }
+        }
+        if (listen) dvStrayClose();
+        return;
+    }
+    if (r->kind == 3) {                                  // staged write-only buffer lock: Lock, copy, Unlock in queue order
+        void* mapped = NULL;
+        if ((LONG)((DWORD(__stdcall*)(DWORD, DWORD, DWORD, void**, DWORD))r->fn)(a[0], a[1], a[2], &mapped, a[3]) >= 0 && mapped)
+            memcpy(mapped, (const void*)(ULONG_PTR)a[5], a[2]);
+        ((DWORD(__stdcall*)(DWORD))(ULONG_PTR)a[4])(a[0]);
+        if (r->objMask & 1) ((DWORD(__stdcall*)(DWORD))(*(DWORD**)(ULONG_PTR)a[0])[2])(a[0]);
+        return;
+    }
+    if (r->kind == 10) { twExecCtl(r); return; }         // a frame's mark (aotr_tween.inc)
+    if (r->kind == 11) { txjExecUpload(r); return; }     // a texture decoded on a worker thread arrives (aotr_texjobs.inc)
+    if (g_twStretch && g_twOpClass[r->op & 511] && twHoldBack(r)) return;                       // a release inside a stretch that may run again: it waits
+    if (r->flags & 1) g_twPresentRec = r;
+    DWORD ret_ = 0;
+    LONG64 tPres = (r->flags & 1) ? qpcNow() : 0;          // v33: how long Present itself takes on the worker (the GPU / swap chain wait)
+    bool listen = g_dvr.rec && (WORD)(r->op - 120) < 80 && dvOpen(r);      // an effect call of a frame that will be drawn again: the device calls D3DX makes for it are kept
+    switch (r->nargs) {
+    case 1:  ((RtF1)r->fn)(a[0]); break;
+    case 2:  ((RtF2)r->fn)(a[0], a[1]); break;
+    case 3:  ((RtF3)r->fn)(a[0], a[1], a[2]); break;
+    case 4:  ((RtF4)r->fn)(a[0], a[1], a[2], a[3]); break;
+    case 5:  ret_ = ((RtF5)r->fn)(a[0], a[1], a[2], a[3], a[4]); break;         // device Present lands here
+    case 6:  ret_ = ((RtF6)r->fn)(a[0], a[1], a[2], a[3], a[4], a[5]); break;   // swap-chain Present lands here
+    case 7:  ((RtF7)r->fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6]); break;
+    case 8:  ((RtF8)r->fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]); break;
+    case 9:  ((RtF9)r->fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]); break;
+    case 10: ((RtF10)r->fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9]); break;
+    }
+    if (listen) dvClose();
+    if (r->objMask) {
+        for (int i = 0; i < r->nargs; ++i)
+            if (((r->objMask >> i) & 1) && a[i]) ((DWORD(__stdcall*)(DWORD))(*(DWORD**)(ULONG_PTR)a[i])[2])(a[i]);   // worker bypasses hooks
+    }
+    if (tPres) g_rtPresentExecTicks += qpcNow() - tPres;
+    if (r->flags & 1) { InterlockedExchange(&g_rtPresentHR, (LONG)ret_); InterlockedDecrement(&g_rtPendingPresents); SetEvent(g_rtPresented); }
+}
+static DWORD WINAPI rtWorker(LPVOID) {
+    g_rtWorkerTid = GetCurrentThreadId();
+    // same x87 precision/rounding and SSE modes as the game thread, so D3DX's x87 preshader math and any
+    // driver float code produce bit-identical results on this thread
+    _control87(g_rtX87, _MCW_PC | _MCW_RC | _MCW_EM | _MCW_IC | _MCW_DN);
+    _mm_setcsr(g_rtMxcsr);
+    SetEvent(g_rtReady);
+    DWORD tail = g_rtTail;
+    for (;;) {
+        DWORD head = g_rtHead;
+        if (tail == head) {
+            if (g_rtDrainWaiting && g_rtMainSleeping && rtSeqReached(g_rtExecSeq, g_rtDrainSeq)) SetEvent(g_rtDrained);
+            g_rtDg.kind = 0xFF;                           // between records
+            if (g_twBusy && !g_rtLK.want) {              // a finished frame waiting for its slot, or the producer wants the ring back
+                EnterCriticalSection(&g_rtExecCs); twService(); LeaveCriticalSection(&g_rtExecCs);
+                if (!g_twHold) g_rtTail = tail;
+            }
+            for (int spins = 0; g_rtHead == tail && spins < 4000; ++spins) _mm_pause();
+            if (g_rtHead == tail) {
+                InterlockedExchange(&g_rtWorkerSleeping, 1);
+                if (g_rtHead == tail) { g_rtWorkerSleeps++; if (WaitForSingleObject(g_rtWake, g_twBusy ? twIdleWaitMs() : 2) == WAIT_TIMEOUT) g_rtWorkerTimeouts++; }   // timed: a lost wakeup costs at most 2 ms
+                InterlockedExchange(&g_rtWorkerSleeping, 0);
+            }
+            continue;
+        }
+#ifndef AOTR_V4_NOLOCKWANT
+        if (g_rtLK.want)                               // a direct call is waiting for the lock: let it in before taking it back
+            for (int k = 0; g_rtLK.want && k < 65536; ++k) _mm_pause();
+#endif
+        EnterCriticalSection(&g_rtExecCs);
+        if (g_twBusy) twService();
+        LONG64 t0 = qpcNow();
+        DWORD seq = g_rtExecSeq;
+#ifndef AOTR_V4_NOLOCKWANT
+        for (int n = 0; n < 256 && tail != head && !g_rtLK.want; ++n) {      // the game thread may want the lock for a direct call
+#else
+        for (int n = 0; n < 256 && tail != head; ++n) {
+#endif
+            RtRec* r = (RtRec*)(g_rtBuf + tail);
+            if (r->kind == 2) { tail = 0; continue; }
+            { ULONG64 a_ = __rdtsc(); rtExec(r); rtWNote((DWORD)((__rdtsc() - a_) >> 10), r->op); }   // v43: the longest call of each second
+            g_rtWH.beat++;
+            seq = r->seq;
+            tail += r->size;
+            if ((n & 31) == 31 && g_pwSlotDue && qpcNow() >= g_pwSlotDue) twServicePictures();     // the screen's next refresh is near: its picture goes up between two records, not after the batch
+        }
+        g_rtTail = g_twHold ? g_twHoldTail : tail; g_rtExecSeq = seq;   // publish progress once per batch (a stretch that may run again keeps its ring space)
+        g_rtWH.cpu = GetCurrentProcessorNumber();
+#ifdef AOTR_V4_CPUSTAT
+        g_rtCpuHistW[GetCurrentProcessorNumber() & 63]++;
+#endif
+        g_rtBusyTicks += qpcNow() - t0;
+        LeaveCriticalSection(&g_rtExecCs);
+        if (g_rtDrainWaiting && g_rtMainSleeping && rtSeqReached(seq, g_rtDrainSeq)) SetEvent(g_rtDrained);
+    }
+    return 0;
+}
+
+// technique mirror (effect -> current technique handle) and pass-count cache, game thread only
+#define RT_FXT 2048
+#define RT_PC  8192
+struct RtTech { DWORD fx, tech; };
+struct RtPass { DWORD fx, tech, passes; };
+static RtTech g_rtTech[RT_FXT];
+static RtPass g_rtPass[RT_PC];
+static void rtTechSet(DWORD fx, DWORD tech) {
+    DWORD h = (fx * 2654435761u) >> 8;
+    for (int i = 0; i < RT_FXT; ++i) { RtTech* e = &g_rtTech[(h + i) & (RT_FXT - 1)];
+        if (e->fx == fx || e->fx == 0) { e->fx = fx; e->tech = tech; return; } }
+}
+static DWORD rtTechGet(DWORD fx) {
+    DWORD h = (fx * 2654435761u) >> 8;
+    for (int i = 0; i < RT_FXT; ++i) { RtTech* e = &g_rtTech[(h + i) & (RT_FXT - 1)];
+        if (e->fx == fx) return e->tech; if (e->fx == 0) return 0; }
+    return 0;
+}
+static bool rtPassGet(DWORD fx, DWORD tech, DWORD* passes) {
+    DWORD h = ((fx ^ (tech * 40503u)) * 2654435761u) >> 8;
+    for (int i = 0; i < RT_PC; ++i) { RtPass* e = &g_rtPass[(h + i) & (RT_PC - 1)];
+        if (e->fx == fx && e->tech == tech) { *passes = e->passes; return true; } if (e->fx == 0) return false; }
+    return false;
+}
+static void rtPassPut(DWORD fx, DWORD tech, DWORD passes) {
+    DWORD h = ((fx ^ (tech * 40503u)) * 2654435761u) >> 8;
+    for (int i = 0; i < RT_PC; ++i) { RtPass* e = &g_rtPass[(h + i) & (RT_PC - 1)];
+        if ((e->fx == fx && e->tech == tech) || e->fx == 0 || e->fx == 1) { e->fx = fx; e->tech = tech; e->passes = passes; return; } }
+}
+static void rtFxForget(DWORD fx) {                     // an effect may be destroyed: drop what we know about it
+    for (int i = 0; i < RT_PC; ++i) if (g_rtPass[i].fx == fx) { g_rtPass[i].fx = 1; g_rtPass[i].tech = 0; }   // tombstone
+    DWORD h = (fx * 2654435761u) >> 8;
+    for (int i = 0; i < RT_FXT; ++i) { RtTech* e = &g_rtTech[(h + i) & (RT_FXT - 1)]; if (e->fx == fx) { e->tech = 0; break; } if (e->fx == 0) break; }
+}
+
+// exec lock for a direct call from the game thread: the worker stops after its current record
+static __forceinline void rtExecLock() { g_rtLK.want = 1; EnterCriticalSection(&g_rtExecCs); g_rtLK.want = 0; }
+
+// diagnostics: who still forces synchronous calls (return address + op), and what the locked surfaces are
+struct RtSyncCaller { DWORD ra; WORD op; WORD pad; LONG n, ln; };
+#define RT_SCN 512
+static RtSyncCaller g_rtSC[RT_SCN];
+static volatile LONG g_rtSCDrop = 0;
+static const char* rtOpName(int op);
+static void rtSyncNote(int op, DWORD ra) {
+    twOnSync(op);                                        // a call outside the queue: may this frame's stretch still be run again?
+    if (g_capOn) capPrintf("S sync %s ra=%08X\n", rtOpName(op), ra);
+#ifdef AOTR_PROD
+    return;
+#else
+    DWORD h = ((ra * 2654435761u) ^ (DWORD)op) >> 23;
+    for (int i = 0; i < 16; ++i) {
+        RtSyncCaller& e = g_rtSC[(h + i) & (RT_SCN - 1)];
+        if (e.ra == ra && e.op == (WORD)op) { e.n++; return; }
+        if (e.ra == 0) { e.op = (WORD)op; e.ra = ra; e.n = 1; return; }
+    }
+    g_rtSCDrop++;
+#endif
+}
+struct RtLockStat { DWORD ra, fmt, usage, flags; WORD w, h, blocker; BYTE pool, fast; LONG n, ln; BYTE who, exact; };   // who: 0 the object itself, 1 its texture; exact: from the object's own entry
+#define RT_LSN 128
+static RtLockStat g_rtLS[RT_LSN];
+static void rtLockNote(DWORD ra, const BYTE* desc, DWORD flags, int fast, WORD blocker = 0xFFFF, BYTE who = 0, BYTE exact = 0) {
+    const DWORD* d = (const DWORD*)desc;                     // D3DSURFACE_DESC: Format Type Usage Pool MSType MSQuality Width Height
+    DWORD h = ((ra * 2654435761u) ^ d[0] ^ (flags << 8) ^ (DWORD)fast) >> 25;
+    for (int i = 0; i < 16; ++i) {
+        RtLockStat& e = g_rtLS[(h + i) & (RT_LSN - 1)];
+        if (e.ra == ra && e.fmt == d[0] && e.flags == flags && e.fast == (BYTE)fast && e.pool == (BYTE)d[3] && e.w == (WORD)d[6] && e.h == (WORD)d[7] && e.usage == d[2]) { e.n++; if (!fast) { e.blocker = blocker; e.who = who; e.exact = exact; } return; }
+        if (e.ra == 0) { e.fmt = d[0]; e.usage = d[2]; e.flags = flags; e.w = (WORD)d[6]; e.h = (WORD)d[7]; e.pool = (BYTE)d[3]; e.fast = (BYTE)fast; e.n = 1; e.blocker = blocker; e.who = who; e.exact = exact; e.ra = ra; return; }
+    }
+}
+
+// ---------------------------------------------------------------- vertex-input state that is already in place
+// SetStreamSource, SetIndices and SetVertexDeclaration are ~31k of the ~140k calls queued in a battle frame: the
+// engine sets them for every draw, and the render list is sorted by model, so most of them bind what is bound
+// already. Binding the same buffer / declaration again changes nothing in Direct3D, so such a call is not queued.
+// The shadow below is what the QUEUE has set (it runs ahead of the worker, in order). It is dropped by everything
+// that can change these bindings behind it: SetFVF (declaration), Draw*PrimitiveUP (stream 0, indices), state block
+// Apply, Reset, any call that does not go through the queue (other thread, direct scope, render thread off), and it
+// is bypassed while a state block is being recorded. A bound object cannot be freed and its address reused while it
+// is bound (the device holds it), so equal pointers mean the same object. Kill switch: AOTR_DEVDEDUPE=0.
+
+#include "aotr_rt_gen.inc"
+static volatile LONG g_rtTMAny = 0;                     // radar texture mirrors live (aotr_rtmirror.inc)
+static volatile LONG g_rtBMAny = 0;                     // buffer mirrors live (rtBufLock)
+static void rtBMKillAll();
+static void rtBMReap();
+static void rtTMReap();
+static volatile LONG g_rtNResetFail = 0;                // device resets the device refused
+static void rtAnnForget(DWORD fx);
+static void rtTMKill(DWORD obj);
+static void rtTMKillAll();
+static DWORD g_rtSurfLockCaller = 0;                       // game code that called SurfaceClass::Lock (set by its detour, for the lock statistics)
+static volatile LONG g_rtNSyncDL = 0;                       // drained locks of system-memory surfaces that were then unlocked directly
+static volatile LONG g_rtInAsyncFilter = 0;                 // worker: inside a queued D3DXFilterTexture of a mirrored texture
+static volatile LONG g_rtNAsyncFilter = 0;
+static bool rtTMLockD3D(DWORD surf, DWORD flags, INT* pitch, void** bits);
+static bool rtTMUnlockD3D(DWORD surf);
+static LONG g_rtTMAtlasOn = 1, g_rtTMAtlasAny = 0;       // terrain atlas mirror; Any: accept every caller (offline harness)
+
+// ---------------------------------------------------------------- hand-written hooks
+#define RT_PASSTHRU(CLS, SLOT, SIG, ...) do { \
+    DWORD tid_ = GetCurrentThreadId(); \
+    if (tid_ != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) { \
+        if (g_rtActive && tid_ != g_rtWorkerTid && tid_ != g_rtMainTid) { EnterCriticalSection(&g_rtExecCs); DWORD r_ = ((SIG)g_rtO_##CLS[SLOT])(__VA_ARGS__); LeaveCriticalSection(&g_rtExecCs); InterlockedIncrement(&g_rtNForeign); return r_; } \
+        return ((SIG)g_rtO_##CLS[SLOT])(__VA_ARGS__); } } while (0)
+#define RT_SYNC(CLS, SLOT, OP, SIG, ...) do { rtSyncNote(OP, (DWORD)(ULONG_PTR)_ReturnAddress()); g_rtCurOp = OP; rtDrain(); EnterCriticalSection(&g_rtExecCs); g_rtDirectScope++; DWORD r_ = ((SIG)g_rtO_##CLS[SLOT])(__VA_ARGS__); \
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); g_rtNSync++; g_rtSyncHist[OP]++; return r_; } while (0)
+
+typedef DWORD (__stdcall* RtS5)(void*, DWORD, DWORD, DWORD, DWORD);
+typedef DWORD (__stdcall* RtS6)(void*, DWORD, DWORD, DWORD, DWORD, DWORD);
+static void rtPresentBackpressure() {
+    g_lrPresentTsc = __rdtsc();                           // the frame's work on the game thread ends here (the logic limiter measures frames by it)
+    if (g_rtPendingPresents <= 1) return;
+    LONG64 t0 = qpcNow();
+    while (g_rtPendingPresents > 1) rtWaitH(g_rtPresented, 2, true);      // the frame is over: the game could be handling its messages itself here
+    g_rtPresentWaitTicks += qpcNow() - t0;
+    g_lrPresentTsc = __rdtsc();
+}
+static void rtMirInvalidate();
+static void rtDirectLocksForget();
+static void rtApplyToggle() {                          // render thread only
+    LONG want = g_rtWantOn;
+    rtDsInvalAll();                                      // the vertex-input shadow does not survive a switch
+    rtSSInvalidate(); rtSSInvalidReason(3);              // nor does the device-state shadow
+    rtMirInvalidate(); rtDirectLocksForget(); rtFreshForget(); rtFBForget();
+    if (want && !g_rtActive) {
+        memset(g_rtTech, 0, sizeof(g_rtTech));          // techniques set while off were not mirrored: Begin re-learns them synchronously
+        InterlockedExchange(&g_rtCoreMode, 0);          // the two flags are kept in step here, and only here
+        InterlockedExchange(&g_rtActive, 1); g_rtToggles++; logf("rt: FULL mode switched ON (queue live; [Engine] RtKey, VK %d) - D3D work goes to the worker again.", (int)g_rtKey); }
+    else if (!want && g_rtActive) { rtDrain(); EnterCriticalSection(&g_rtExecCs); InterlockedExchange(&g_rtActive, 0); LeaveCriticalSection(&g_rtExecCs);
+        InterlockedExchange(&g_rtCoreMode, 1);
+        g_rtToggles++; logf("rt: CORE mode (queue off; [Engine] RtKey, VK %d) - every call runs directly on the game thread again.", (int)g_rtKey); }
+    else if (!want && !g_rtActive) {
+        InterlockedExchange(&g_rtCoreMode, 1);          // already core: make sure the derived flag agrees
+    }
+}
+static void (*g_rtFrameTick)() = NULL;                   // once a frame on the game thread, before the frame's Present is queued (aotr_shadowmap.inc)
+// ---- v29: the frame boundary the measurement lives on, taken from Present itself.
+// In a lean build (no AOTR_DIAG=1) the engine stage markers are not installed, so nothing else
+// increments g_mkFrames or feeds the frame-gap histogram (stBegin(1) in aotr_accel.cpp never runs).
+// The render-thread path used to cover that with `if (!g_engineHooks) ++g_mkFrames;` below, but
+// RT_PASSTHRU returns before it in CORE mode - which is exactly the mode that shipped as the
+// default, and the reason a whole two-hour session reported "0.0 fps, 0 stalls, 0 frames".
+// So the boundary is now taken here, once per Present on the game thread, before either path runs:
+// every mode counts frames, and the stall detector, the cause attribution and the A/B segments all
+// read the same numbers. rtFrameBoundary() is a no-op once the engine markers are live, so a
+// diagnostic build never double-counts.
+static void (*g_rtFrameB)() = NULL;
+static void rtWireFrameBoundary() {                       // called once from the install path, after rtInit
+    g_rtFrameB = rtFrameBoundary;
+    logf("rt: frame boundary taken from Present - the frame counter, the stall detector and the A/B segments work in CORE and FULL alike%s.",
+         g_mkFrameMark ? " (the engine stage markers are live, so Present keeps out of their way)" : "");
+}
+static __forceinline void rtFrameB() {
+    if (g_rtFrameB) g_rtFrameB();
+}
+static DWORD __stdcall rt_dev_17(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3) {      // Present
+    if (g_rtFrameTick) g_rtFrameTick();
+    if (g_rtBypassRetryAt && GetCurrentThreadId() == g_rtMainTid) rtBypassRetryTick();     // v34: the freeze guard's 10 s are over
+    if (g_rtInstalled && ((g_rtWantOn != 0) != (g_rtActive != 0)) && GetCurrentThreadId() == g_rtMainTid) rtApplyToggle();
+    if (g_mgPendN) mgFrameTick();
+    rtFrameB();                                           // one frame boundary per real frame, in every mode
+    RT_PASSTHRU(dev, 17, RtS5, self, a0, a1, a2, a3);
+    if (a3) RT_SYNC(dev, 17, 17, RtS5, self, a0, a1, a2, a3);                                   // dirty region: rare
+    RtRec* r = rtAlloc(5, (a0 ? 16 : 0) + (a1 ? 16 : 0)); r->fn = g_rtO_dev[17]; r->op = 17; r->flags = 1 | twFrameEnd();
+    r->pad = (DWORD)qpcNow() | 1;                         // when the game thread finished this frame: aotr_tween.inc measures how long until it is on screen
+    DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+    A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtBytes(P, &po, a0, 16); A[2] = rtBytes(P, &po, a1, 16); A[3] = a2; A[4] = 0;
+    InterlockedIncrement(&g_rtPendingPresents); g_rtNPresent++;
+    rtCommit(r, po);
+    rtPresentBackpressure();                              // at most one finished frame waiting on the worker
+    return (DWORD)g_rtPresentHR;                          // the last Present the worker actually ran
+}
+static DWORD __stdcall rt_sc_3(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3, DWORD a4) {   // IDirect3DSwapChain9::Present
+    if (g_rtFrameTick) g_rtFrameTick();
+    if (g_rtBypassRetryAt && GetCurrentThreadId() == g_rtMainTid) rtBypassRetryTick();     // v34: the freeze guard's 10 s are over
+    if (g_rtInstalled && ((g_rtWantOn != 0) != (g_rtActive != 0)) && GetCurrentThreadId() == g_rtMainTid) rtApplyToggle();
+    if (g_mgPendN) mgFrameTick();
+    rtFrameB();                                           // same boundary for the swap chain's Present
+    RT_PASSTHRU(sc, 3, RtS6, self, a0, a1, a2, a3, a4);
+    if (a3) RT_SYNC(sc, 3, 393, RtS6, self, a0, a1, a2, a3, a4);
+    RtRec* r = rtAlloc(6, (a0 ? 16 : 0) + (a1 ? 16 : 0)); r->fn = g_rtO_sc[3]; r->op = 393; r->flags = 1 | twFrameEnd();
+    r->pad = (DWORD)qpcNow() | 1;
+    DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+    A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtBytes(P, &po, a0, 16); A[2] = rtBytes(P, &po, a1, 16); A[3] = a2; A[4] = 0; A[5] = a4;
+    InterlockedIncrement(&g_rtPendingPresents); g_rtNPresent++;
+    rtCommit(r, po);
+    rtPresentBackpressure();
+    return (DWORD)g_rtPresentHR;
+}
+static float __stdcall rt_dev_80(void* self) {                                                  // GetNPatchMode (float return)
+    typedef float (__stdcall* F)(void*);
+    DWORD tid = GetCurrentThreadId();
+    if (g_rtActive && tid == g_rtMainTid && !g_rtDirectScope) { rtDrain(); EnterCriticalSection(&g_rtExecCs); g_rtDirectScope++; float f = ((F)g_rtO_dev[80])(self); g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); return f; }
+    if (g_rtActive && tid != g_rtWorkerTid && tid != g_rtMainTid) { EnterCriticalSection(&g_rtExecCs); float f = ((F)g_rtO_dev[80])(self); LeaveCriticalSection(&g_rtExecCs); return f; }
+    return ((F)g_rtO_dev[80])(self);
+}
+static __forceinline DWORD rtPrimVerts(DWORD type, DWORD prims) {
+    switch (type) { case 1: return prims; case 2: return prims * 2; case 3: return prims + 1; case 4: return prims * 3; case 5: case 6: return prims + 2; }
+    return 0;
+}
+static DWORD __stdcall rt_dev_83(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3) {      // DrawPrimitiveUP
+    rtDsInvalUP(0);                                      // Direct3D unbinds stream 0 after a ...UP draw
+    RT_PASSTHRU(dev, 83, RtS5, self, a0, a1, a2, a3);
+    DWORD vb = a2 ? rtPrimVerts(a0, a1) * a3 : 0;
+    RtRec* r = rtAlloc(5, vb); r->fn = g_rtO_dev[83]; r->op = 83;
+    DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+    A[0] = (DWORD)(ULONG_PTR)self; A[1] = a0; A[2] = a1; A[3] = rtBytes(P, &po, a2, vb); A[4] = a3;
+    rtCommit(r, po); return 0;
+}
+typedef DWORD (__stdcall* RtS9)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+static DWORD __stdcall rt_dev_84(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3, DWORD a4, DWORD a5, DWORD a6, DWORD a7) {  // DrawIndexedPrimitiveUP
+    rtDsInvalUP(1);                                      // Direct3D unbinds stream 0 and the indices after a ...UP draw
+    RT_PASSTHRU(dev, 84, RtS9, self, a0, a1, a2, a3, a4, a5, a6, a7);
+    DWORD ib = a4 ? rtPrimVerts(a0, a3) * (a5 == 102 ? 4 : 2) : 0;
+    DWORD vb = a6 ? (a1 + a2) * a7 : 0;
+    RtRec* r = rtAlloc(9, ib + vb); r->fn = g_rtO_dev[84]; r->op = 84;
+    DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+    A[0] = (DWORD)(ULONG_PTR)self; A[1] = a0; A[2] = a1; A[3] = a2; A[4] = a3; A[5] = rtBytes(P, &po, a4, ib); A[6] = a5; A[7] = rtBytes(P, &po, a6, vb); A[8] = a7;
+    rtCommit(r, po); return 0;
+}
+typedef DWORD (__stdcall* RtS1)(void*);
+typedef DWORD (__stdcall* RtS2)(void*, DWORD);
+typedef DWORD (__stdcall* RtS3)(void*, DWORD, DWORD);
+typedef DWORD (__stdcall* RtS4)(void*, DWORD, DWORD, DWORD);
+static DWORD __stdcall rt_fx_2(void* self) {                                                    // ID3DXEffect::Release
+    DWORD tid = GetCurrentThreadId();
+    if (!g_rtActive && !g_rtTried && rtIsGameThread(tid) && !g_rtXDepth) rtInstall(self);
+    RT_PASSTHRU(fx, 2, RtS1, self);
+    rtFxForget((DWORD)(ULONG_PTR)self);
+    rtQForget((DWORD)(ULONG_PTR)self);
+    rtAnnForget((DWORD)(ULONG_PTR)self);
+    InterlockedIncrement(&g_twFxGen);
+    RT_SYNC(fx, 2, 122, RtS1, self);
+    return 0;
+}
+static DWORD __stdcall rt_fx_20(void* self, DWORD a0, DWORD a1, DWORD a2) {                    // SetValue
+    DWORD tid = GetCurrentThreadId();
+    if (!g_rtActive && !g_rtTried && rtIsGameThread(tid) && !g_rtXDepth) rtInstall(self);
+    RT_PASSTHRU(fx, 20, RtS4, self, a0, a1, a2);
+    if (a2 == 0xFFFFFFFFu || a2 > (1u << 20)) RT_SYNC(fx, 20, 140, RtS4, self, a0, a1, a2);     // D3DX_DEFAULT size: let D3DX decide
+    RtRec* r = rtAlloc(4, rtHandleBytes(a0) + (a1 ? a2 : 0)); r->fn = g_rtO_fx[20]; r->op = 140;
+    DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+    A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtHandle(P, &po, a0); A[2] = rtBytes(P, &po, a1, a2); A[3] = a2;
+    rtCommit(r, po); return 0;
+}
+static DWORD rtPtrArray(void* self, DWORD a0, DWORD a1, DWORD a2, int slot, int op) {             // Set(Transpose)MatrixPointerArray
+    if (!a1 || a2 > 4096) RT_SYNC(fx, slot, op, RtS4, self, a0, a1, a2);
+    RtRec* r = rtAlloc(4, rtHandleBytes(a0) + a2 * 64 + a2 * 4 + 32); r->fn = g_rtO_fx[slot]; r->op = (WORD)op;
+    DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+    A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtHandle(P, &po, a0);
+    DWORD at = rtAl16(po); const DWORD* src = (const DWORD*)(ULONG_PTR)a1;
+    for (DWORD i = 0; i < a2; ++i) memcpy(P + at + i * 64, (const void*)(ULONG_PTR)src[i], 64);
+    DWORD at2 = rtAl16(at + a2 * 64);
+    for (DWORD i = 0; i < a2; ++i) ((DWORD*)(P + at2))[i] = (DWORD)(ULONG_PTR)(P + at + i * 64);
+    po = at2 + a2 * 4;
+    A[2] = (DWORD)(ULONG_PTR)(P + at2); A[3] = a2;
+    rtCommit(r, po); return 0;
+}
+static DWORD __stdcall rt_fx_42(void* self, DWORD a0, DWORD a1, DWORD a2) {
+    DWORD tid = GetCurrentThreadId();
+    if (!g_rtActive && !g_rtTried && rtIsGameThread(tid) && !g_rtXDepth) rtInstall(self);
+    RT_PASSTHRU(fx, 42, RtS4, self, a0, a1, a2);
+    return rtPtrArray(self, a0, a1, a2, 42, 162);
+}
+static DWORD __stdcall rt_fx_48(void* self, DWORD a0, DWORD a1, DWORD a2) {
+    DWORD tid = GetCurrentThreadId();
+    if (!g_rtActive && !g_rtTried && rtIsGameThread(tid) && !g_rtXDepth) rtInstall(self);
+    RT_PASSTHRU(fx, 48, RtS4, self, a0, a1, a2);
+    return rtPtrArray(self, a0, a1, a2, 48, 168);
+}
+static DWORD __stdcall rt_fx_58(void* self, DWORD a0) {                                        // SetTechnique (+ mirror)
+    DWORD tid = GetCurrentThreadId();
+    if (!g_rtActive && !g_rtTried && rtIsGameThread(tid) && !g_rtXDepth) rtInstall(self);
+    RT_PASSTHRU(fx, 58, RtS2, self, a0);
+    rtTechSet((DWORD)(ULONG_PTR)self, rtIsName(a0) ? 0 : a0);
+    RtRec* r = rtAlloc(2, rtHandleBytes(a0)); r->fn = g_rtO_fx[58]; r->op = 178;
+    DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+    A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtHandle(P, &po, a0);
+    rtCommit(r, po); return 0;
+}
+static DWORD __stdcall rt_fx_63(void* self, DWORD a0, DWORD a1) {                              // Begin (pass count from cache)
+    DWORD tid = GetCurrentThreadId();
+    if (!g_rtActive && !g_rtTried && rtIsGameThread(tid) && !g_rtXDepth) rtInstall(self);
+    RT_PASSTHRU(fx, 63, RtS3, self, a0, a1);
+    DWORD fx = (DWORD)(ULONG_PTR)self, tech = rtTechGet(fx), passes = 0;
+    if (tech && rtPassGet(fx, tech, &passes)) {
+        if (a0) *(UINT*)(ULONG_PTR)a0 = passes;
+        RtRec* r = rtAlloc(3, 4); r->fn = g_rtO_fx[63]; r->op = 183;
+        DWORD* A = rtArgs(r); BYTE* P = rtPayload(r);
+        A[0] = fx; A[1] = (DWORD)(ULONG_PTR)P; A[2] = a1;      // D3DX writes the pass count into the record
+        rtCommit(r, 4); return 0;
+    }
+    if (tech && g_rtO_fx[5]) {                           // a technique met for the first time. The number Begin hands back is the technique's pass
+        struct { const char* name; UINT passes, annotations; } td = { NULL, 0, 0 };      // count: the effect's own data, which nothing queued changes
+        rtExecLock(); g_rtDirectScope++;
+        DWORD hd = ((DWORD(__stdcall*)(void*, DWORD, void*))g_rtO_fx[5])(self, tech, &td);                // GetTechniqueDesc
+        g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+        if ((LONG)hd >= 0 && td.passes && td.passes < 256) {
+            rtPassPut(fx, tech, td.passes); g_rtNBeginDesc++;
+            if (a0) *(UINT*)(ULONG_PTR)a0 = td.passes;
+            RtRec* r = rtAlloc(3, 4); r->fn = g_rtO_fx[63]; r->op = 183;
+            DWORD* A = rtArgs(r); BYTE* P = rtPayload(r);
+            A[0] = fx; A[1] = (DWORD)(ULONG_PTR)P; A[2] = a1;
+            rtCommit(r, 4); return 0;
+        }
+    }
+    twOnSync(183);                                      // this Begin is not in the stream
+    rtDrain(); EnterCriticalSection(&g_rtExecCs); g_rtDirectScope++;
+    DWORD hr = ((RtS3)g_rtO_fx[63])(self, a0, a1);
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); g_rtNSync++; g_rtSyncHist[183]++;
+    if ((LONG)hr >= 0 && tech && a0) rtPassPut(fx, tech, *(UINT*)(ULONG_PTR)a0);
+    return hr;
+}
+static DWORD __stdcall rt_fx_71(void* self, DWORD a0) {                                        // SetStateManager: callbacks into game code
+    RT_PASSTHRU(fx, 71, RtS2, self, a0);
+    if (a0) {                                           // D3DX would call game code from the worker: stop the render thread for good
+        rtDrain(); EnterCriticalSection(&g_rtExecCs);
+        InterlockedExchange(&g_rtInstalled, 0); InterlockedExchange(&g_rtActive, 0);   // from here on every hook passes straight through
+        DWORD hr = ((RtS2)g_rtO_fx[71])(self, a0);
+        LeaveCriticalSection(&g_rtExecCs);
+        logf("rt: the game installed an ID3DXEffectStateManager - render thread switched OFF (all calls direct again).");
+        return hr;
+    }
+    RT_SYNC(fx, 71, 191, RtS2, self, a0);
+    return 0;
+}
+
+
+// ---------------------------------------------------------------- render-target / depth-stencil mirrors
+// GetRenderTarget / GetDepthStencilSurface answer from the state the queued Set* calls will leave on the device,
+// validated exactly as DXVK validates the Set* call (index range, NULL target 0, RENDERTARGET / DEPTHSTENCIL usage).
+// Unknown until the first synchronous Get or Set; invalidated by Reset, by the live toggle and by any Set* that
+// runs outside the queue (D3DX scopes, other threads, render thread off).
+#define RT_D3DERR_NOTFOUND 0x88760866u
+static DWORD g_rtMirRT[4], g_rtMirDS;
+static BYTE  g_rtMirRTOk[4], g_rtMirDSOk;
+static void rtMirInvalidate() { g_rtMirRTOk[0] = g_rtMirRTOk[1] = g_rtMirRTOk[2] = g_rtMirRTOk[3] = 0; g_rtMirDSOk = 0; }
+// The right original for a method of a surface that may belong to a class we never hooked: one implementation
+// can give depth-stencil surfaces, back buffers and plain surfaces separate vtables, and only the class seen at
+// install time is in g_rtO_surf. Where our hook sits in this object's own vtable the saved original is the right
+// function; where it does not, the object's own entry is.
+static void* rtSurfOrig(DWORD surf, int slot) {
+    DWORD fn = 0;
+    __try { fn = (*(DWORD**)(ULONG_PTR)surf)[slot]; } __except (EXCEPTION_EXECUTE_HANDLER) { return NULL; }
+    if (!fn) return NULL;
+    if (fn == (DWORD)(ULONG_PTR)g_rtH_surf[slot]) return g_rtO_surf[slot];
+    return (void*)(ULONG_PTR)fn;
+}
+static __forceinline bool rtSurfUsage(DWORD surf, DWORD* usage) {
+    // What GetDesc returns is immutable, and it has to be this surface's own GetDesc: rtSurfOrig picks the right
+    // one for the object's class.
+    BYTE d[32];
+    void* fn = rtSurfOrig(surf, 12);
+    if (!fn) return false;
+    LONG hr = (LONG)((RtS2)(ULONG_PTR)fn)((void*)(ULONG_PTR)surf, (DWORD)(ULONG_PTR)d);
+    if (hr < 0) return false;
+    *usage = ((DWORD*)d)[2]; return true;
+}
+#define RT_DS_DIRECT(SLOT, SIG, ...) \
+    if (tid != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) { \
+        if (g_rtActive && tid != g_rtWorkerTid && tid != g_rtMainTid) { EnterCriticalSection(&g_rtExecCs); DWORD r_ = ((SIG)g_rtO_dev[SLOT])(__VA_ARGS__); LeaveCriticalSection(&g_rtExecCs); InterlockedIncrement(&g_rtNForeign); return r_; } \
+        return ((SIG)g_rtO_dev[SLOT])(__VA_ARGS__); \
+    }
+static DWORD __stdcall rt_dev_100(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3) {        // SetStreamSource(stream, buffer, offset, stride)
+    DWORD tid = __readfsdword(0x24);
+    DWORD named = a1;                                    // the game's own buffer: bound from here on, however the call travels
+    if (g_mgAny && a1) a1 = mgAlias(a1);                 // a model's buffer -> its multi-copy twin (copy 0 is the original)
+    if (tid != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) { if (a0 < 16) g_rtDs.vbOk &= ~(1u << a0); else g_rtDs.vbOk = 0; if (tid == g_rtMainTid) rtFBName(named); }
+    RT_DS_DIRECT(100, RtS5, self, a0, a1, a2, a3)
+    bool track = g_rtDs.on && !g_rtDs.recording && a0 < 16;
+    if (track && g_rtDs.dev == (DWORD)(ULONG_PTR)self && ((g_rtDs.vbOk >> a0) & 1) && g_rtDs.vb[a0] == a1 && g_rtDs.off[a0] == a2 && g_rtDs.stride[a0] == a3) { PSTAT(g_rtDs.nSkip++); return 0; }
+    rtFBName(named);
+    RtRec* r = rtAlloc(5, 0); r->fn = g_rtO_dev[100]; r->op = 100;
+    DWORD* A = rtArgs(r);
+    A[0] = (DWORD)(ULONG_PTR)self; A[1] = a0; A[2] = rtObj(r, 2, a1); A[3] = a2; A[4] = a3;
+    rtCommit(r, 0);
+    if (track) {
+        if (g_rtDs.dev != (DWORD)(ULONG_PTR)self) { rtDsInvalAll(); g_rtDs.dev = (DWORD)(ULONG_PTR)self; }
+        g_rtDs.vb[a0] = a1; g_rtDs.off[a0] = a2; g_rtDs.stride[a0] = a3; g_rtDs.vbOk |= 1u << a0;
+    } else if (a0 < 16) g_rtDs.vbOk &= ~(1u << a0);
+    PSTAT(g_rtDs.nSet++);
+    return 0;
+}
+static DWORD __stdcall rt_dev_104(void* self, DWORD a0) {                                       // SetIndices
+    DWORD tid = __readfsdword(0x24);
+    DWORD named = a0;
+    if (g_mgAny && a0) a0 = mgAlias(a0);
+    if (tid != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) { g_rtDs.ibOk = 0; if (tid == g_rtMainTid) rtFBName(named); }
+    RT_DS_DIRECT(104, RtS2, self, a0)
+    bool track = g_rtDs.on && !g_rtDs.recording;
+    if (track && g_rtDs.dev == (DWORD)(ULONG_PTR)self && g_rtDs.ibOk && g_rtDs.ib == a0) { PSTAT(g_rtDs.nSkip++); return 0; }
+    rtFBName(named);
+    RtRec* r = rtAlloc(2, 0); r->fn = g_rtO_dev[104]; r->op = 104;
+    DWORD* A = rtArgs(r);
+    A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtObj(r, 1, a0);
+    rtCommit(r, 0);
+    if (track) { if (g_rtDs.dev != (DWORD)(ULONG_PTR)self) { rtDsInvalAll(); g_rtDs.dev = (DWORD)(ULONG_PTR)self; } g_rtDs.ib = a0; g_rtDs.ibOk = 1; } else g_rtDs.ibOk = 0;
+    PSTAT(g_rtDs.nSet++);
+    return 0;
+}
+static DWORD __stdcall rt_dev_87(void* self, DWORD a0) {                                        // SetVertexDeclaration
+    DWORD tid = __readfsdword(0x24);
+    if (tid != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) g_rtDs.declOk = 0;
+    RT_DS_DIRECT(87, RtS2, self, a0)
+    bool track = g_rtDs.on && !g_rtDs.recording;
+    if (track && g_rtDs.dev == (DWORD)(ULONG_PTR)self && g_rtDs.declOk && g_rtDs.decl == a0) { PSTAT(g_rtDs.nSkip++); return 0; }
+    RtRec* r = rtAlloc(2, 0); r->fn = g_rtO_dev[87]; r->op = 87;
+    DWORD* A = rtArgs(r);
+    A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtObj(r, 1, a0);
+    rtCommit(r, 0);
+    if (track) { if (g_rtDs.dev != (DWORD)(ULONG_PTR)self) { rtDsInvalAll(); g_rtDs.dev = (DWORD)(ULONG_PTR)self; } g_rtDs.decl = a0; g_rtDs.declOk = 1; } else g_rtDs.declOk = 0;
+    PSTAT(g_rtDs.nSet++);
+    return 0;
+}
+// ---------------------------------------------------------------- UpdateSurface out of a small system-memory surface
+// The engine keeps a few 64x64 system-memory surfaces that it locks, edits and uploads with UpdateSurface several
+// times a frame. Queued as it was, the upload names the source surface, and D3D reads the source's pixels when the
+// call finally runs on the worker - so the engine's NEXT lock of that surface had to wait until the whole queue was
+// done (~2 ms each, the biggest remaining wait in a battle). Now the rectangle's pixels are read when the call is
+// made and travel in the record; the worker writes them into a private system-memory surface of the same size and
+// format and uploads from that. The destination gets exactly the pixels it would have got, in the same place in the
+// queue, and the engine's surface is never named by a queued call. Kill switch: AOTR_USSNAP=0.
+static LONG g_rtUSOn = 1;
+static volatile LONG g_rtNUSSnap = 0, g_rtNUSGeneric = 0, g_rtNUSStage = 0;
+struct RtUSStage { DWORD dev, w, h, fmt; DWORD surf; };
+#define RT_USN 12
+static RtUSStage g_rtUS[RT_USN];
+static BYTE* g_rtUSTmp = NULL;
+static __forceinline DWORD rtFmtBytes(DWORD f) { return (f == 21 || f == 22) ? 4 : (f == 20 ? 3 : ((f >= 23 && f <= 26) || f == 51) ? 2 : ((f == 28 || f == 50) ? 1 : 0)); }
+static DWORD rtUSStageFor(void* dev, DWORD w, DWORD h, DWORD fmt) {                            // game thread
+    for (int i = 0; i < RT_USN; ++i) if (g_rtUS[i].surf && g_rtUS[i].dev == (DWORD)(ULONG_PTR)dev && g_rtUS[i].w == w && g_rtUS[i].h == h && g_rtUS[i].fmt == fmt) return g_rtUS[i].surf;
+    int slot = -1; for (int i = 0; i < RT_USN; ++i) if (!g_rtUS[i].surf) { slot = i; break; }
+    if (slot < 0) return 0;
+    void* sfc = NULL;
+    rtExecLock(); g_rtDirectScope++;
+    DWORD hr = ((DWORD(__stdcall*)(void*, DWORD, DWORD, DWORD, DWORD, void**, void*))g_rtO_dev[36])(dev, w, h, fmt, 2, &sfc, NULL);   // CreateOffscreenPlainSurface, SYSTEMMEM
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+    if ((LONG)hr < 0 || !sfc) return 0;
+    g_rtUS[slot].dev = (DWORD)(ULONG_PTR)dev; g_rtUS[slot].w = w; g_rtUS[slot].h = h; g_rtUS[slot].fmt = fmt; g_rtUS[slot].surf = (DWORD)(ULONG_PTR)sfc; g_rtNUSStage++;
+    return g_rtUS[slot].surf;
+}
+static void rtUSForget() {                                                                   // game thread, before a device Reset: nothing queued may still use them
+    bool any = false; for (int i = 0; i < RT_USN; ++i) if (g_rtUS[i].surf) any = true;
+    if (!any) return;
+    rtDrain(); EnterCriticalSection(&g_rtExecCs); g_rtDirectScope++;
+    for (int i = 0; i < RT_USN; ++i) if (g_rtUS[i].surf) { void* rel = rtSurfOrig(g_rtUS[i].surf, 2); if (rel) ((DWORD(__stdcall*)(void*))rel)((void*)(ULONG_PTR)g_rtUS[i].surf); g_rtUS[i].surf = 0; }
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+}
+static DWORD __stdcall rt_dev_30(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3) {          // UpdateSurface(src, srcRect, dst, dstPoint)
+    RT_PASSTHRU(dev, 30, RtS5, self, a0, a1, a2, a3);
+    if (g_rtUSOn && a0 && a2 && !g_rtObjRefs) {
+        BYTE desc[32]; void* gd = rtSurfOrig(a0, 12);
+        if (gd && (LONG)((RtS2)gd)((void*)(ULONG_PTR)a0, (DWORD)(ULONG_PTR)desc) >= 0) {
+            const DWORD* d = (const DWORD*)desc;                                                // Format Type Usage Pool MSType MSQuality Width Height
+            DWORD bpp = rtFmtBytes(d[0]), w = d[6], h = d[7];
+            LONG l = 0, t = 0, r = (LONG)w, b = (LONG)h;
+            if (a1) { const LONG* q = (const LONG*)(ULONG_PTR)a1; l = q[0]; t = q[1]; r = q[2]; b = q[3]; }
+            if (d[3] == 2 && bpp && w && h && w <= 512 && h <= 512 && l >= 0 && t >= 0 && r > l && b > t && r <= (LONG)w && b <= (LONG)h) {
+                if (!g_rtUSTmp) g_rtUSTmp = (BYTE*)VirtualAlloc(NULL, 512 * 512 * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                DWORD stage = g_rtUSTmp ? rtUSStageFor(self, w, h, d[0]) : 0;
+                void* fl = rtSurfOrig(a0, 13); void* fu = rtSurfOrig(a0, 14);
+                DWORD rw = (DWORD)(r - l), rh = (DWORD)(b - t), rowBytes = rw * bpp, bytes = rowBytes * rh;
+                bool got = false;
+                if (stage && fl && fu) {
+                    struct { LONG l, t, r, b; } rc = { l, t, r, b };
+                    struct { INT pitch; void* bits; } lr = { 0, NULL };
+                    rtExecLock(); g_rtDirectScope++;
+                    if (!rtRefPending(a0) && (LONG)((DWORD(__stdcall*)(void*, void*, void*, DWORD))fl)((void*)(ULONG_PTR)a0, &lr, &rc, 0x10 | 0x800) >= 0) {   // READONLY | NOSYSLOCK
+                        if (lr.bits && lr.pitch >= (INT)rowBytes) { for (DWORD y = 0; y < rh; ++y) memcpy(g_rtUSTmp + y * rowBytes, (const BYTE*)lr.bits + (INT)y * lr.pitch, rowBytes); got = true; }
+                        ((DWORD(__stdcall*)(void*))fu)((void*)(ULONG_PTR)a0);
+                    }
+                    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+                }
+                if (got) {
+                    RtRec* rec = rtAlloc(15, bytes); rec->kind = 9; rec->fn = g_rtO_dev[30]; rec->op = 30;
+                    DWORD* A = rtArgs(rec); BYTE* P = rtPayload(rec); DWORD po = 0;
+                    A[0] = (DWORD)(ULONG_PTR)self; A[1] = stage; A[2] = (DWORD)l; A[3] = (DWORD)t; A[4] = (DWORD)r; A[5] = (DWORD)b; A[6] = bpp;
+                    A[7] = rtBytes(P, &po, (DWORD)(ULONG_PTR)g_rtUSTmp, bytes);
+                    A[8] = a2; A[9] = a3 ? (DWORD)((const LONG*)(ULONG_PTR)a3)[0] : 0; A[10] = a3 ? (DWORD)((const LONG*)(ULONG_PTR)a3)[1] : 0;
+                    A[11] = (a1 ? 1u : 0u) | (a3 ? 2u : 0u);
+                    A[12] = (DWORD)(ULONG_PTR)g_rtO_surf[13]; A[13] = (DWORD)(ULONG_PTR)g_rtO_surf[14]; A[14] = (DWORD)(ULONG_PTR)g_rtO_dev[30];
+                    rtTouch(a2, 30); g_rtRefOp[rtRefIdx(a2)] = 30; rtFreshName(a2);                       // the destination is named, the source is not
+                    rtCommit(rec, po); g_rtNUSSnap++;
+                    return 0;
+                }
+            }
+        }
+    }
+    g_rtNUSGeneric++;
+    DWORD pl = (a1 ? 16 : 0) + (a3 ? 8 : 0);
+    RtRec* r = rtAlloc(5, pl); r->fn = g_rtO_dev[30]; r->op = 30;
+    DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+    A[0] = (DWORD)(ULONG_PTR)self;
+    A[1] = rtObj(r, 1, a0);
+    A[2] = rtBytes(P, &po, a1, 16);
+    A[3] = rtObj(r, 3, a2);
+    A[4] = rtBytes(P, &po, a3, 8);
+    rtCommit(r, po); return 0;
+}
+static __forceinline DWORD* rtFxRoom(DWORD need) {                                             // need: bytes, a multiple of 4
+    if (g_rtFxRec) {
+        if (g_rtFxPos + need <= RT_FX_CAP && g_rtFxN < RT_FX_MAXN) return (DWORD*)(g_rtFxBase + g_rtFxPos);
+        rtFxClose();
+    }
+    RtRec* r = rtAlloc(0, RT_FX_CAP);
+    r->kind = 8; r->op = 510; r->fn = (void*)g_rtO_fx;
+    g_rtFxRec = r; g_rtFxBase = rtPayload(r); g_rtFxPos = 0; g_rtFxN = 0;
+    return (DWORD*)g_rtFxBase;
+}
+#define RT_FX_PRE(SLOT, SIG, ...) \
+    DWORD tid = __readfsdword(0x24); \
+    if (tid != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) { rtFxInvalAll(0); g_rtNFxOffSlot[(SLOT) & 127]++; g_rtNFxOffWho[tid != g_rtMainTid ? (tid == g_rtWorkerTid ? 3 : 0) : (!g_rtActive ? 1 : 2)]++; } \
+    if (!g_rtActive && !g_rtTried && rtIsGameThread(tid) && !g_rtXDepth) rtInstall(self); \
+    if (tid != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) { \
+        if (g_rtActive && tid != g_rtWorkerTid && tid != g_rtMainTid) { EnterCriticalSection(&g_rtExecCs); DWORD r_ = ((SIG)g_rtO_fx[SLOT])(__VA_ARGS__); LeaveCriticalSection(&g_rtExecCs); InterlockedIncrement(&g_rtNForeign); return r_; } \
+        return ((SIG)g_rtO_fx[SLOT])(__VA_ARGS__); \
+    }
+typedef DWORD (__stdcall* RtFxS3)(void*, DWORD, DWORD);
+typedef DWORD (__stdcall* RtFxS5)(void*, DWORD, DWORD, DWORD, DWORD);
+// SetBool / SetInt / SetFloat [h v]
+// ---------------------------------------------------------------- effect parameters that already hold the value
+// A frame capture of a heavy battle (2026-09-18) shows what the engine actually writes: in the shadow pass one
+// world-matrix handle is set 4,668 times a frame with only 327 distinct matrices - 4,421 of those writes are the
+// IDENTITY matrix, in runs of up to 2,397 (a static caster's vertices are already in world space). Whole handles are
+// constant for the frame (two per-batch matrices and two floats, 973 writes each, every one identical), and across
+// both passes about 39,000 parameter writes a frame set the value the effect already holds.
+// Setting a D3DX effect parameter to the value it already has changes nothing, so such a write is not queued. What
+// the effect holds is tracked per (effect, handle) here; anything that can change a parameter behind this table drops
+// it: applying a parameter block, the recording of one (during which nothing is skipped or remembered), releasing an
+// effect, a device reset, and every call that does not go through the queue (another thread, a direct scope, the
+// render thread off). Textures and raw values are never skipped: a released texture's address can come back for a
+// different texture, and raw values were measured 98% distinct anyway. Kill switch: AOTR_FXDEDUPE=0.
+#define RT_FXV 16384                                             // power of two, open addressing, 4 probes
+struct RtFxVal { DWORD fx, h, epoch; WORD slot, nb; BYTE v[64]; };
+static RtFxVal* g_rtFxV = NULL;                // committed at install
+static DWORD g_rtFxEpoch = 1;
+static LONG g_rtFxDedupeOn = 1, g_rtFxRecording = 0;
+// The engine applies a parameter block per batch (about 2,000 times a frame), and a block sets only a handful of
+// parameters. Which ones is known from the recording between BeginParameterBlock and EndParameterBlock: those
+// handles are dropped from the table when the block is applied, instead of dropping everything.
+#define RT_FXB 64
+struct RtFxBlk { LONG n; LONG known; DWORD fx[RT_FXB], h[RT_FXB]; };
+static RtFxBlk* g_rtFxBlk = NULL;                             // indexed like the parameter-block proxies
+static RtFxBlk g_rtFxBlkRec;
+static volatile LONG g_rtNFxBlkInval = 0;
+static volatile LONG g_rtNFxSkip = 0, g_rtNFxKept = 0, g_rtNFxInval = 0;
+static volatile LONG g_rtNFxOffSlot[128], g_rtNFxOffWho[4];   // which setter, and from where: 0 other thread, 1 render thread off, 2 direct scope, 3 the render worker itself
+static volatile LONG g_rtNFxInvalWhy[4] = { 0, 0, 0, 0 };   // 0 off-queue call, 1 parameter block without a recording, 2 device reset, 3 other
+// (when the counter wraps the whole table is forgotten: an entry written 4 billion drops ago under the number the
+// counter starts again at would otherwise count as current. sizeof(g_rtFxV) is a pointer's four bytes.)
+static __forceinline void rtFxInvalAll(int why = 3) {
+    if (!g_rtFxV) return;
+    g_rtNFxInvalWhy[why & 3]++; if (++g_rtFxEpoch == 0) { memset(g_rtFxV, 0, (SIZE_T)RT_FXV * sizeof(RtFxVal)); g_rtFxEpoch = 1; } g_rtNFxInval++; }
+static __forceinline void rtFxForget(DWORD fx, DWORD h) {     // this handle's value is no longer known
+    if (!g_rtFxV) return;
+    DWORD i = ((fx >> 4) ^ (h * 2654435761u)) & (RT_FXV - 1);
+    for (int k = 0; k < 4; ++k, i = (i + 1) & (RT_FXV - 1)) {
+        RtFxVal& e = g_rtFxV[i];
+        if (e.epoch == g_rtFxEpoch && e.fx == fx && e.h == h) { e.epoch = 0; return; }
+        if (e.epoch != g_rtFxEpoch) return;
+    }
+}
+static void rtFxBlkApply(DWORD idx) {                          // a recorded block was applied
+    RtFxBlk* b = (g_rtFxBlk && idx < RT_PBN) ? &g_rtFxBlk[idx] : NULL;
+    if (!b || !b->known) { rtFxInvalAll(1); return; }
+    for (LONG i = 0; i < b->n; ++i) rtFxForget(b->fx[i], b->h[i]);
+    g_rtNFxBlkInval++;
+}
+// true: the effect already holds these bytes for this handle (nothing to do). Otherwise the table remembers them.
+static __forceinline bool rtFxHeld(void* self, DWORD h, DWORD slot, const void* p, DWORD nb) {
+    if (!g_rtFxDedupeOn || !g_rtFxV || !p || nb > 64 || rtIsName(h)) return false;
+    DWORD fx = (DWORD)(ULONG_PTR)self;
+    if (g_rtFxRecording) {                                     // recorded into a block: its value is no longer known, and the block sets it
+        rtFxForget(fx, h);
+        RtFxBlk& b = g_rtFxBlkRec;
+        for (LONG i = 0; i < b.n; ++i) if (b.fx[i] == fx && b.h[i] == h) return false;
+        if (b.n < RT_FXB) { b.fx[b.n] = fx; b.h[b.n] = h; b.n++; } else b.known = 0;
+        return false;
+    }
+    DWORD i = ((fx >> 4) ^ (h * 2654435761u)) & (RT_FXV - 1);
+    for (int k = 0; k < 4; ++k, i = (i + 1) & (RT_FXV - 1)) {
+        RtFxVal& e = g_rtFxV[i];
+        if (e.epoch == g_rtFxEpoch && e.fx == fx && e.h == h) {
+            if (e.slot == (WORD)slot && e.nb == (WORD)nb && !memcmp(e.v, p, nb)) { PSTAT(g_rtNFxSkip++); return true; }
+            e.slot = (WORD)slot; e.nb = (WORD)nb; memcpy(e.v, p, nb); PSTAT(g_rtNFxKept++); return false;
+        }
+        if (e.epoch != g_rtFxEpoch) {                            // a free slot, or one left from an older epoch
+            e.epoch = g_rtFxEpoch; e.fx = fx; e.h = h; e.slot = (WORD)slot; e.nb = (WORD)nb; memcpy(e.v, p, nb); PSTAT(g_rtNFxKept++); return false;
+        }
+    }
+    g_rtNFxKept++;
+    return false;                                                // four collisions: this handle is simply never skipped
+}
+static __forceinline DWORD rtFxSetValue(void* self, DWORD a0, DWORD a1, DWORD slot) {
+    if (g_dgTracing) dgTraceAdd(slot, self, a0, &a1, 4);
+    if (rtFxHeld(self, a0, slot, &a1, 4)) return 0;
+    if (!g_rtFxBatchOn || rtIsName(a0)) {
+        RtRec* r = rtAlloc(3, rtHandleBytes(a0)); r->fn = g_rtO_fx[slot]; r->op = (WORD)(120 + slot);
+        DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+        A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtHandle(P, &po, a0); A[2] = a1;
+        rtCommit(r, po); return 0;
+    }
+    DWORD* e = rtFxRoom(16);
+    e[0] = slot; e[1] = (DWORD)(ULONG_PTR)self; e[2] = a0; e[3] = a1;
+    g_rtFxPos += 16; g_rtFxN++; PSTAT(g_rtFx.opN[(slot - 22) >> 2]++);   // 22 -> 0, 26 -> 1, 30 -> 2
+    return 0;
+}
+// SetVector / SetMatrix / SetMatrixTranspose [h p16|p64]
+static __forceinline DWORD rtFxSetBytes(void* self, DWORD a0, DWORD a1, DWORD slot, DWORD nb) {
+    if (g_dgTracing) dgTraceAdd(slot, self, a0, (const void*)(ULONG_PTR)a1, a1 ? nb : 0);
+    if (a1 && rtFxHeld(self, a0, slot, (const void*)(ULONG_PTR)a1, nb)) return 0;
+    if (!g_rtFxBatchOn || rtIsName(a0)) {
+        RtRec* r = rtAlloc(3, rtHandleBytes(a0) + (a1 ? nb : 0)); r->fn = g_rtO_fx[slot]; r->op = (WORD)(120 + slot);
+        DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+        A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtHandle(P, &po, a0); A[2] = rtBytes(P, &po, a1, nb);
+        rtCommit(r, po); return 0;
+    }
+    if (a1) {
+        DWORD* e = rtFxRoom(12 + nb);
+        e[0] = slot | (nb << 8) | 0x80000000u; e[1] = (DWORD)(ULONG_PTR)self; e[2] = a0;
+        memcpy(e + 3, (const void*)(ULONG_PTR)a1, nb);
+        g_rtFxPos += 12 + nb;
+    } else {
+        DWORD* e = rtFxRoom(12);
+        e[0] = slot; e[1] = (DWORD)(ULONG_PTR)self; e[2] = a0;
+        g_rtFxPos += 12;
+    }
+    g_rtFxN++; PSTAT(g_rtFx.opN[slot == 34 ? 3 : (slot == 38 ? 4 : 5)]++);
+    return 0;
+}
+static DWORD __stdcall rt_fx_22(void* self, DWORD a0, DWORD a1) { RT_FX_PRE(22, RtFxS3, self, a0, a1) return rtFxSetValue(self, a0, a1, 22); }     // SetBool
+static DWORD __stdcall rt_fx_26(void* self, DWORD a0, DWORD a1) { RT_FX_PRE(26, RtFxS3, self, a0, a1) return rtFxSetValue(self, a0, a1, 26); }     // SetInt
+static DWORD __stdcall rt_fx_30(void* self, DWORD a0, DWORD a1) { RT_FX_PRE(30, RtFxS3, self, a0, a1) return rtFxSetValue(self, a0, a1, 30); }     // SetFloat
+static DWORD __stdcall rt_fx_34(void* self, DWORD a0, DWORD a1) { RT_FX_PRE(34, RtFxS3, self, a0, a1) return rtFxSetBytes(self, a0, a1, 34, 16); } // SetVector
+static DWORD __stdcall rt_fx_38(void* self, DWORD a0, DWORD a1) { RT_FX_PRE(38, RtFxS3, self, a0, a1) return rtFxSetBytes(self, a0, a1, 38, 64); } // SetMatrix
+static DWORD __stdcall rt_fx_44(void* self, DWORD a0, DWORD a1) { RT_FX_PRE(44, RtFxS3, self, a0, a1) return rtFxSetBytes(self, a0, a1, 44, 64); } // SetMatrixTranspose
+static DWORD __stdcall rt_fx_52(void* self, DWORD a0, DWORD a1) {                                // SetTexture [h o]
+    RT_FX_PRE(52, RtFxS3, self, a0, a1)
+    if (!g_rtFxBatchOn || rtIsName(a0) || (a1 && g_rtObjRefs)) {                                  // per-call object refs need a record of their own
+        RtRec* r = rtAlloc(3, rtHandleBytes(a0)); r->fn = g_rtO_fx[52]; r->op = 172;
+        DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+        A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtHandle(P, &po, a0); A[2] = rtObj(r, 2, a1);
+        rtCommit(r, po); return 0;
+    }
+    DWORD* e = rtFxRoom(16);                                                                      // first: the batch this entry joins decides the sequence number
+    if (a1) { rtTouch(a1, 172); g_rtRefOp[rtRefIdx(a1)] = 172; rtFreshName(a1); }                     // named by the batch's own record, exactly as rtObj would
+    e[0] = 52; e[1] = (DWORD)(ULONG_PTR)self; e[2] = a0; e[3] = a1;
+    g_rtFxPos += 16; g_rtFxN++; g_rtFx.opN[6]++;
+    return 0;
+}
+static DWORD __stdcall rt_fx_78(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3) {          // SetRawValue [h p v v]
+    RT_FX_PRE(78, RtFxS5, self, a0, a1, a2, a3)
+    if (g_dgTracing) dgTraceAdd(78, self, a0, (const void*)(ULONG_PTR)a1, a1 ? a3 : 0);
+    if (!g_rtFxBatchOn || rtIsName(a0) || (a1 && a3 > 2048)) {
+        RtRec* r = rtAlloc(5, rtHandleBytes(a0) + (a1 ? a3 : 0)); r->fn = g_rtO_fx[78]; r->op = 198;
+        DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+        A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtHandle(P, &po, a0); A[2] = rtBytes(P, &po, a1, a1 ? a3 : 0); A[3] = a2; A[4] = a3;
+        rtCommit(r, po); return 0;
+    }
+    DWORD nb = a1 ? a3 : 0, room = 20 + ((nb + 3) & ~3u);
+    DWORD* e = rtFxRoom(room);
+    e[0] = 78 | (nb << 8) | (a1 ? 0x80000000u : 0); e[1] = (DWORD)(ULONG_PTR)self; e[2] = a0; e[3] = a2; e[4] = a3;
+    if (nb) memcpy(e + 5, (const void*)(ULONG_PTR)a1, nb);
+    g_rtFxPos += room; g_rtFxN++; g_rtFx.opN[7]++;
+    return 0;
+}
+static DWORD __stdcall rt_dev_23(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3, DWORD a4, DWORD a5, DWORD a6, DWORD a7) {   // CreateTexture
+    DWORD tid = __readfsdword(0x24);
+    typedef DWORD (__stdcall* RtCT)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+    if (tid != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) {
+        if (g_rtActive && tid != g_rtWorkerTid && tid != g_rtMainTid) { EnterCriticalSection(&g_rtExecCs); DWORD r_ = ((RtCT)g_rtO_dev[23])(self, a0, a1, a2, a3, a4, a5, a6, a7); LeaveCriticalSection(&g_rtExecCs); InterlockedIncrement(&g_rtNForeign); return r_; }
+        return ((RtCT)g_rtO_dev[23])(self, a0, a1, a2, a3, a4, a5, a6, a7);
+    }
+    rtExecLock(); g_rtDirectScope++;
+    DWORD r = ((RtCT)g_rtO_dev[23])(self, a0, a1, a2, a3, a4, a5, a6, a7);
+    if ((LONG)r >= 0 && a6) rtFreshAdd(*(DWORD*)(ULONG_PTR)a6);                                 // nothing queued can name it yet
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+    g_rtNLocked++; return r;
+}
+static DWORD rtCreateBuffer(void* self, int slot, DWORD a0, DWORD a1, DWORD a2, DWORD a3, DWORD a4, DWORD a5) {   // CreateVertexBuffer / CreateIndexBuffer(length, usage, fvf or format, pool, &buffer, shared)
+    DWORD tid = __readfsdword(0x24);
+    typedef DWORD (__stdcall* RtCB)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+    if (tid != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) {
+        if (g_rtActive && tid != g_rtWorkerTid && tid != g_rtMainTid) { EnterCriticalSection(&g_rtExecCs); DWORD r_ = ((RtCB)g_rtO_dev[slot])(self, a0, a1, a2, a3, a4, a5); LeaveCriticalSection(&g_rtExecCs); InterlockedIncrement(&g_rtNForeign); return r_; }
+        return ((RtCB)g_rtO_dev[slot])(self, a0, a1, a2, a3, a4, a5);
+    }
+    rtExecLock(); g_rtDirectScope++;
+    DWORD r = ((RtCB)g_rtO_dev[slot])(self, a0, a1, a2, a3, a4, a5);
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+    if ((LONG)r >= 0 && a4 && g_rtFBOn) rtFBAdd(*(DWORD*)(ULONG_PTR)a4);                        // nothing queued can name it yet
+    g_rtNLocked++; return r;
+}
+static DWORD __stdcall rt_dev_26(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3, DWORD a4, DWORD a5) { return rtCreateBuffer(self, 26, a0, a1, a2, a3, a4, a5); }
+static DWORD __stdcall rt_dev_27(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3, DWORD a4, DWORD a5) { return rtCreateBuffer(self, 27, a0, a1, a2, a3, a4, a5); }
+static DWORD __stdcall rt_dev_16(void* self, DWORD a0) {                                       // Reset
+    if ((g_mgAny || g_mgPendN) && GetCurrentThreadId() == g_rtMainTid) mgDropAll("device reset");
+    twOnReset();                                         // our off-screen frames and state block go before the device is reset
+    txjOnReset();                                        // the display format may change: D3DX's questions are asked again
+    rtMirInvalidate(); rtDsInvalAll(); rtFxInvalAll(2);
+    rtSSInvalidate(); rtSSInvalidReason(1);              // a device reset: nothing the queue set survives it
+    // The copies kept of buffers and textures ("mirrors") each hold a reference to their object, and a mirror that
+    // is only marked dead gives it back at some later lock. A device with a default-pool object still alive refuses
+    // to be reset (DXVK counts them, as Direct3D does), and one kind of mirror is of exactly such objects: a dynamic
+    // buffer made and filled whole inside a frame that is drawn twice. The engine makes its dynamic buffers anew
+    // after every reset, so the next reset - alt-tab back in, or out a second time - found one held here, failed,
+    // and failed again every frame (nothing locks a buffer while the device is not reset, so nothing gave the
+    // reference back) until the game gave up after fifty tries: the crash after alt-tabbing, v52 to v69. So the
+    // references go back NOW, through the queue, and the wait below runs those releases before the reset.
+    if (g_rtTMAny) { rtTMKillAll(); if (GetCurrentThreadId() == g_rtMainTid) rtTMReap(); }
+    if (g_rtBMAny) { rtBMKillAll(); if (GetCurrentThreadId() == g_rtMainTid) rtBMReap(); }
+    RT_PASSTHRU(dev, 16, RtS2, self, a0);
+    rtDirectLocksForget(); rtFreshForget(); rtFBForget();
+    rtSyncNote(16, (DWORD)(ULONG_PTR)_ReturnAddress()); g_rtCurOp = 16; rtDrain();
+    EnterCriticalSection(&g_rtExecCs); g_rtDirectScope++;
+    DWORD r_ = ((RtS2)g_rtO_dev[16])(self, a0);
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); g_rtNSync++; g_rtSyncHist[16]++;
+    if ((LONG)r_ >= 0) InterlockedExchange(&g_rtPresentHR, 0);    // the device is back: forget the lost result
+    else if (InterlockedIncrement(&g_rtNResetFail) <= 3) twResetRefused(r_);     // the game asks again every frame and ends itself after fifty refusals: say what is known
+    return r_;
+}
+static DWORD __stdcall rt_dev_37(void* self, DWORD a0, DWORD a1) {                             // SetRenderTarget
+    { DWORD tid_ = GetCurrentThreadId(); if (tid_ != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) rtMirInvalidate(); }
+    RT_PASSTHRU(dev, 37, RtS3, self, a0, a1);
+    if (a0 < 4 && !(a0 == 0 && !a1)) {
+        DWORD usage = 0;
+        if (!a1) { g_rtMirRT[a0] = 0; g_rtMirRTOk[a0] = 1; }
+        else if (rtSurfUsage(a1, &usage)) { if (usage & 1) { g_rtMirRT[a0] = a1; g_rtMirRTOk[a0] = 1; } }   // D3DUSAGE_RENDERTARGET, else the call fails
+        else g_rtMirRTOk[a0] = 0;
+    }
+    RtRec* r = rtAlloc(3, 0); r->fn = g_rtO_dev[37]; r->op = 37;
+    DWORD* A = rtArgs(r); A[0] = (DWORD)(ULONG_PTR)self; A[1] = a0; A[2] = rtObj(r, 2, a1);
+    rtCommit(r, 0); return 0;
+}
+static DWORD __stdcall rt_dev_39(void* self, DWORD a0) {                                       // SetDepthStencilSurface
+    { DWORD tid_ = GetCurrentThreadId(); if (tid_ != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) rtMirInvalidate(); }
+    RT_PASSTHRU(dev, 39, RtS2, self, a0);
+    { DWORD usage = 0;
+      if (!a0) { g_rtMirDS = 0; g_rtMirDSOk = 1; }
+      else if (rtSurfUsage(a0, &usage)) { if (usage & 2) { g_rtMirDS = a0; g_rtMirDSOk = 1; } }            // D3DUSAGE_DEPTHSTENCIL, else the call fails
+      else g_rtMirDSOk = 0; }
+    RtRec* r = rtAlloc(2, 0); r->fn = g_rtO_dev[39]; r->op = 39;
+    DWORD* A = rtArgs(r); A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtObj(r, 1, a0);
+    rtCommit(r, 0); return 0;
+}
+static DWORD __stdcall rt_dev_38(void* self, DWORD a0, DWORD a1) {                             // GetRenderTarget
+    RT_PASSTHRU(dev, 38, RtS3, self, a0, a1);
+    if (a0 < 4 && a1 && g_rtMirRTOk[a0]) {
+        DWORD sfc = g_rtMirRT[a0]; g_rtNMirror++;
+        if (!sfc) { *(DWORD*)(ULONG_PTR)a1 = 0; return RT_D3DERR_NOTFOUND; }
+        { void* af = rtSurfOrig(sfc, 1); if (!af) return RT_D3DERR_NOTFOUND; ((RtS1)af)((void*)(ULONG_PTR)sfc); }   // AddRef, as DXVK's ref()
+        *(DWORD*)(ULONG_PTR)a1 = sfc; return 0;
+    }
+    rtSyncNote(38, (DWORD)(ULONG_PTR)_ReturnAddress()); g_rtCurOp = 38;
+    rtDrain(); EnterCriticalSection(&g_rtExecCs); g_rtDirectScope++;
+    DWORD hr = ((RtS3)g_rtO_dev[38])(self, a0, a1);
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); g_rtNSync++; g_rtSyncHist[38]++;
+    if (a0 < 4 && a1) {
+        if ((LONG)hr >= 0) { g_rtMirRT[a0] = *(DWORD*)(ULONG_PTR)a1; g_rtMirRTOk[a0] = 1; }
+        else if (hr == RT_D3DERR_NOTFOUND) { g_rtMirRT[a0] = 0; g_rtMirRTOk[a0] = 1; }
+    }
+    return hr;
+}
+static DWORD __stdcall rt_dev_40(void* self, DWORD a0) {                                       // GetDepthStencilSurface
+    RT_PASSTHRU(dev, 40, RtS2, self, a0);
+    if (a0 && g_rtMirDSOk) {
+        DWORD sfc = g_rtMirDS; g_rtNMirror++;
+        if (!sfc) { *(DWORD*)(ULONG_PTR)a0 = 0; return RT_D3DERR_NOTFOUND; }
+        { void* af = rtSurfOrig(sfc, 1); if (!af) return RT_D3DERR_NOTFOUND; ((RtS1)af)((void*)(ULONG_PTR)sfc); }
+        *(DWORD*)(ULONG_PTR)a0 = sfc; return 0;
+    }
+    rtSyncNote(40, (DWORD)(ULONG_PTR)_ReturnAddress()); g_rtCurOp = 40;
+    rtDrain(); EnterCriticalSection(&g_rtExecCs); g_rtDirectScope++;
+    DWORD hr = ((RtS2)g_rtO_dev[40])(self, a0);
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); g_rtNSync++; g_rtSyncHist[40]++;
+    if (a0) {
+        if ((LONG)hr >= 0) { g_rtMirDS = *(DWORD*)(ULONG_PTR)a0; g_rtMirDSOk = 1; }
+        else if (hr == RT_D3DERR_NOTFOUND) { g_rtMirDS = 0; g_rtMirDSOk = 1; }
+    }
+    return hr;
+}
+
+// ---------------------------------------------------------------- direct locks of surfaces only memory can reach
+// A SYSTEMMEM / SCRATCH surface, and (v27) a MANAGED surface that is not a render target or depth stencil, are
+// never sampled by draws; only calls that name them (or their texture) read or write their memory - a queued
+// LockRect record, UpdateSurface, the engine's per-pixel and shroud writes, an upload - and every one of those
+// stamps the object in the queue. When none of those is still queued, LockRect runs at once under the exec lock
+// instead of waiting for the whole queue, and its UnlockRect runs directly too. Anything else keeps the
+// synchronous path. The managed extension is where the ~370 waits a battle frame went: the minimap (128x128
+// A8R8G8B8, managed) is locked hundreds of times a frame and had to drain the whole queue every time because a
+// managed surface outside the brand-new set was not considered trackable; it is exactly as trackable as the
+// system-memory ones.
+struct RtDL { DWORD obj, sub, surf; };                    // (surface, 0, surface) or (texture, level, level surface)
+#define RT_DLN 64
+static RtDL g_rtDL[RT_DLN];
+static int g_rtNDL = 0;
+static volatile LONG g_rtNPlainSL = 0, g_rtNPlainDirect = 0, g_rtNPlainTo = 0;   // managed non-RT locks: asked, answered directly, waited only for the records naming them
+static void rtDirectLocksForget() { g_rtNDL = 0; }
+static const GUID kRtIIDUnknown = {0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};   // container: texture, swap chain or device
+static __forceinline bool rtSysPool(const BYTE* desc) { DWORD pool = ((const DWORD*)desc)[3]; return pool == 2 || pool == 3; }
+static DWORD __stdcall rt_surf_13(void* self, DWORD a0, DWORD a1, DWORD a2) {                  // IDirect3DSurface9::LockRect
+    if (g_rtTMAtlasOn && a0 && !a1 && g_rtActive && !g_rtDirectScope && __readfsdword(0x24) == g_rtMainTid) {   // the terrain atlas: full lock, served from its mirror
+        DWORD ra0 = (DWORD)(ULONG_PTR)_ReturnAddress();
+        if (g_rtTMAtlasAny || (ra0 >= 0x004EEC82u && ra0 < 0x004EEE80u)) {
+            INT pitch = 0; void* bits = NULL;
+            if (rtTMLockD3D((DWORD)(ULONG_PTR)self, a2, &pitch, &bits)) { ((INT*)(ULONG_PTR)a0)[0] = pitch; ((void**)(ULONG_PTR)a0)[1] = bits; return 0; }
+        }
+    }
+    if (g_rtTMAny && !(g_rtInAsyncFilter && __readfsdword(0x24) == g_rtWorkerTid)) rtTMKill((DWORD)(ULONG_PTR)self);   // a lock outside the mirror paths (the queued mip filter only reads level 0)
+    RT_PASSTHRU(surf, 13, RtS4, self, a0, a1, a2);
+    if (g_txjOn && !(a2 & 0x10) && __readfsdword(0x24) == g_rtMainTid) txjLockWrite(0, (DWORD)(ULONG_PTR)self);
+    DWORD sfc = (DWORD)(ULONG_PTR)self, ra = (DWORD)(ULONG_PTR)_ReturnAddress();
+    if (ra == 0x00516067u && g_rtSurfLockCaller) ra = g_rtSurfLockCaller;   // SurfaceClass::Lock: the statistics name ITS caller (4 arguments + its 8 bytes of locals above the return address)
+    BYTE desc[32]; bool sysSurf = false, plainS = false; WORD pendOp = 0xFFFF; BYTE pendWho = 0, pendExact = 0;
+    if ((LONG)((RtS2)g_rtO_surf[12])(self, (DWORD)(ULONG_PTR)desc) >= 0) {                     // GetDesc: immutable
+        sysSurf = rtSysPool(desc);
+        plainS = !sysSurf && (((const DWORD*)desc)[2] & 3) == 0;                              // managed, not a render target or depth: written only by calls that name it
+        if (plainS) g_rtNPlainSL++;
+        if ((sysSurf || plainS || g_rtFreshN) && g_rtNDL < RT_DLN) {
+            rtExecLock(); g_rtDirectScope++;
+            DWORD cont = 0; void* c = NULL;
+            if ((LONG)((DWORD(__stdcall*)(void*, const GUID*, void**))g_rtO_surf[11])(self, &kRtIIDUnknown, &c) >= 0 && c) {    // GetContainer
+                cont = (DWORD)(ULONG_PTR)c; ((DWORD(__stdcall*)(void*))(*(void***)c)[2])(c);
+            }
+            bool fresh_ = !rtSysPool(desc) && cont && rtFreshHas(cont);
+            if (fresh_) g_rtNFreshLock++; else if (!rtSysPool(desc) && !plainS) g_rtNFreshMiss++;
+            bool targeted = sysSurf || fresh_ || plainS;
+            bool pendS = false, pendC = false; DWORD seqS = 0, seqC = 0;
+            if (targeted) {
+                pendS = rtRefPending(sfc); if (pendS) { pendOp = g_rtPendOp; pendExact = g_rtPendExact; seqS = g_rtPendSeq; }
+                if (cont && (pendC = rtRefPending(cont)) != false) { seqC = g_rtPendSeq; if (!pendS) { pendOp = g_rtPendOp; pendExact = g_rtPendExact; pendWho = 1; } }
+                if (fresh_ && !pendS && pendC && g_txjOn) {         // a new texture, only its own decoded levels on their way: the game thread brings them in itself
+                    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+                    bool in_ = txjFlushNow(cont);
+                    rtExecLock(); g_rtDirectScope++;
+                    if (in_ && (pendC = rtRefPending(cont)) != false) seqC = g_rtPendSeq;
+                }
+                if (pendS || pendC) {                               // nothing but the records naming it (or its texture) touches such a surface: wait for the newest of those, not for the queue
+                    DWORD upTo = (pendS && pendC) ? ((DWORD)(seqS - seqC) < 0x80000000u ? seqS : seqC) : (pendS ? seqS : seqC);
+                    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+                    g_rtCurOp = 303; rtDrainTo(upTo); g_rtNDrainTo++;
+                    if (plainS && !sysSurf && !fresh_) g_rtNPlainTo++;
+                    rtExecLock(); g_rtDirectScope++;
+                    pendS = rtRefPending(sfc); pendC = !pendS && cont && rtRefPending(cont);
+                }
+            }
+            if (targeted && !pendS && !pendC) {
+                DWORD hr = ((RtS4)g_rtO_surf[13])(self, a0, a1, a2);
+                if ((LONG)hr >= 0) { RtDL& e = g_rtDL[g_rtNDL++]; e.obj = sfc; e.sub = 0; e.surf = sfc; }
+                g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+                g_rtNDirectLock++; if (plainS && !sysSurf && !fresh_) g_rtNPlainDirect++;
+                rtLockNote(ra, desc, a2, 1);
+                return hr;
+            }
+            g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+        }
+        rtLockNote(ra, desc, a2, 0, pendOp, pendWho, pendExact);
+    }
+    // Synchronous: the queue drains, then the lock runs here. A system-memory surface locked this way is remembered
+    // as locked directly, so its UnlockRect runs directly as well instead of being queued. (A queued unlock left the
+    // surface "pending" when the engine uploaded it a moment later, which sent that UpdateSurface down the generic
+    // path, which made the next lock of the same staging surface wait again: v23 shows whole bursts of 64x64 glyph
+    // uploads each waiting for the queue once one of them had.)
+    rtSyncNote(303, ra); g_rtCurOp = 303; rtDrain(); EnterCriticalSection(&g_rtExecCs); g_rtDirectScope++;
+    DWORD hr_ = ((RtS4)g_rtO_surf[13])(self, a0, a1, a2);
+    if ((LONG)hr_ >= 0 && (sysSurf || plainS) && g_rtNDL < RT_DLN) { RtDL& e = g_rtDL[g_rtNDL++]; e.obj = sfc; e.sub = 0; e.surf = sfc; g_rtNSyncDL++; }
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); g_rtNSync++; g_rtSyncHist[303]++;
+    return hr_;
+}
+static DWORD __stdcall rt_surf_14(void* self) {                                                // IDirect3DSurface9::UnlockRect
+    RT_PASSTHRU(surf, 14, RtS1, self);
+    DWORD sfc = (DWORD)(ULONG_PTR)self;
+    if (g_rtTMAny && rtTMUnlockD3D(sfc)) return 0;                                                // locked through the atlas mirror: the rows are queued
+    for (int i = g_rtNDL - 1; i >= 0; --i) {
+        if (g_rtDL[i].surf != sfc) continue;
+        g_rtDL[i] = g_rtDL[--g_rtNDL];
+        rtExecLock(); g_rtDirectScope++;
+        DWORD hr = ((RtS1)g_rtO_surf[14])(self);
+        g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+        g_rtNDirectUnlock++;
+        return hr;
+    }
+    RtRec* r = rtAlloc(1, 0); r->fn = g_rtO_surf[14]; r->op = 304; rtArgs(r)[0] = sfc;
+    rtTouch(sfc, 304); g_rtRefOp[rtRefIdx(sfc)] = 304; rtCommit(r, 0); return 0;
+}
+static DWORD __stdcall rt_tex_19(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3) {        // IDirect3DTexture9::LockRect(level, locked, rect, flags)
+    if (g_rtTMAny && !(g_rtInAsyncFilter && __readfsdword(0x24) == g_rtWorkerTid)) rtTMKill((DWORD)(ULONG_PTR)self);
+    RT_PASSTHRU(tex, 19, RtS5, self, a0, a1, a2, a3);
+    if (g_txjOn && !(a3 & 0x10) && __readfsdword(0x24) == g_rtMainTid) txjLockWrite((DWORD)(ULONG_PTR)self, 0);
+    DWORD t = (DWORD)(ULONG_PTR)self, ra = (DWORD)(ULONG_PTR)_ReturnAddress();
+    BYTE desc[32]; WORD tPendOp = 0xFFFF; BYTE tPendWho = 0, tPendExact = 0;
+    if ((LONG)((RtS3)g_rtO_tex[17])(self, a0, (DWORD)(ULONG_PTR)desc) >= 0) {                  // GetLevelDesc: immutable
+        bool plainT = !rtSysPool(desc) && (((const DWORD*)desc)[2] & 3) == 0;                  // managed texture, no render target levels (v27, see rt_surf_13)
+        if (plainT) g_rtNPlainSL++;
+        if ((rtSysPool(desc) || plainT || rtFreshHas(t)) && g_rtNDL < RT_DLN) {
+            bool fresh_ = !rtSysPool(desc) && rtFreshHas(t);
+            if (fresh_) g_rtNFreshLock++;
+            rtExecLock(); g_rtDirectScope++;
+            void* lvl = NULL;
+            ((RtS3)g_rtO_tex[18])(self, a0, (DWORD)(ULONG_PTR)&lvl);                                // GetSurfaceLevel
+            DWORD ls = (DWORD)(ULONG_PTR)lvl;
+            if (lvl) { void* rf = rtSurfOrig((DWORD)(ULONG_PTR)lvl, 2); if (rf) ((RtS1)rf)(lvl); }
+            bool pendT = rtRefPending(t), pendL = false; DWORD seqT = 0, seqL = 0;
+            if (pendT) { tPendOp = g_rtPendOp; tPendExact = g_rtPendExact; seqT = g_rtPendSeq; }
+            if (ls && (pendL = rtRefPending(ls)) != false) { seqL = g_rtPendSeq; if (!pendT) { tPendOp = g_rtPendOp; tPendExact = g_rtPendExact; tPendWho = 1; } }
+            if (fresh_ && pendT && !pendL && g_txjOn) {             // a new texture, only its own decoded levels on their way (see rt_surf_13)
+                g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+                bool in_ = txjFlushNow(t);
+                rtExecLock(); g_rtDirectScope++;
+                if (in_ && (pendT = rtRefPending(t)) != false) seqT = g_rtPendSeq;
+            }
+            if (pendT || pendL) {
+                DWORD upTo = (pendT && pendL) ? ((DWORD)(seqT - seqL) < 0x80000000u ? seqT : seqL) : (pendT ? seqT : seqL);
+                g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+                g_rtCurOp = 219; rtDrainTo(upTo); g_rtNDrainTo++;
+                if (plainT && !fresh_) g_rtNPlainTo++;
+                rtExecLock(); g_rtDirectScope++;
+                pendT = rtRefPending(t); pendL = !pendT && ls && rtRefPending(ls);
+            }
+            if (!pendT && !pendL) {
+                DWORD hr = ((RtS5)g_rtO_tex[19])(self, a0, a1, a2, a3);
+                if ((LONG)hr >= 0) { RtDL& e = g_rtDL[g_rtNDL++]; e.obj = t; e.sub = a0; e.surf = ls; }
+                g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+                g_rtNDirectLock++; if (plainT && !fresh_) g_rtNPlainDirect++;
+                rtLockNote(ra, desc, a3 | 0x80000000u, 1);
+                return hr;
+            }
+            g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+        }
+        rtLockNote(ra, desc, a3 | 0x80000000u, 0, tPendOp, tPendWho, tPendExact);
+    }
+    RT_SYNC(tex, 19, 219, RtS5, self, a0, a1, a2, a3);
+    return 0;
+}
+static DWORD __stdcall rt_tex_20(void* self, DWORD a0) {                                       // IDirect3DTexture9::UnlockRect(level)
+    RT_PASSTHRU(tex, 20, RtS2, self, a0);
+    DWORD t = (DWORD)(ULONG_PTR)self;
+    if (g_rtNDL) {
+        DWORD ls = 0;
+        for (int i = g_rtNDL - 1; i >= 0; --i) {
+            bool hit = (g_rtDL[i].obj == t && g_rtDL[i].sub == a0);
+            if (!hit && g_rtDL[i].obj == g_rtDL[i].surf) {                                          // locked through the level surface?
+                if (!ls) { void* lvl = NULL; g_rtDirectScope++; ((RtS3)g_rtO_tex[18])(self, a0, (DWORD)(ULONG_PTR)&lvl);
+                           if (lvl) { ls = (DWORD)(ULONG_PTR)lvl; void* rf = rtSurfOrig(ls, 2); if (rf) ((RtS1)rf)(lvl); } g_rtDirectScope--; }
+                hit = ls && g_rtDL[i].surf == ls;
+            }
+            if (!hit) continue;
+            g_rtDL[i] = g_rtDL[--g_rtNDL];
+            rtExecLock(); g_rtDirectScope++;
+            DWORD hr = ((RtS2)g_rtO_tex[20])(self, a0);
+            g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+            g_rtNDirectUnlock++;
+            return hr;
+        }
+    }
+    RtRec* r = rtAlloc(2, 0); r->fn = g_rtO_tex[20]; r->op = 220; DWORD* A = rtArgs(r); A[0] = t; A[1] = a0;
+    rtTouch(t, 220); g_rtRefOp[rtRefIdx(t)] = 220; rtCommit(r, 0); return 0;
+}
+
+// ---------------------------------------------------------------- immutable ID3DXEffect queries (cached)
+// Descriptions, handle lookups and IsParameterUsed never change for a live effect. The game asks for them
+// thousands of times per frame (GetParameterDesc ~9000/frame in battle), and each one used to force a full
+// queue drain. First call per key runs synchronously; later calls are answered from this cache.
+#define RT_QC 65536
+struct RtQ { DWORD fx; WORD slot; BYTE pad0; BYTE valid; DWORD a0, a1; DWORD soff; WORD slen; WORD pad1; DWORD ret; BYTE out[44]; };
+static RtQ* g_rtQ = NULL;
+#define RT_QSTR (4u << 20)
+static char* g_rtQStr = NULL;                           // key strings, append-only
+static DWORD g_rtQStrTop = 0;
+static __forceinline DWORD rtQHash(DWORD fx, DWORD slot, DWORD a0, DWORD a1) {
+    DWORD h = (fx * 2654435761u) ^ (slot * 40503u) ^ (a0 * 2246822519u) ^ (a1 * 3266489917u);
+    return h ^ (h >> 15);
+}
+static RtQ* rtQFind(DWORD fx, DWORD slot, DWORD a0, DWORD a1, const char* str, int slen) {
+    if (!g_rtQ) return NULL;
+    DWORD h = rtQHash(fx, slot, a0, a1);
+    for (int i = 0; i < 64; ++i) {
+        RtQ* e = &g_rtQ[(h + i) & (RT_QC - 1)];
+        if (e->fx == 0) return NULL;
+        if (e->valid && e->fx == fx && e->slot == slot && e->a0 == a0 && e->a1 == a1 && e->slen == (WORD)slen && (slen == 0 || memcmp(g_rtQStr + e->soff, str, slen) == 0)) return e;
+    }
+    return NULL;
+}
+static RtQ* rtQNew(DWORD fx, DWORD slot, DWORD a0, DWORD a1, const char* str, int slen) {
+    if (!g_rtQ) return NULL;
+    DWORD h = rtQHash(fx, slot, a0, a1);
+    for (int i = 0; i < 64; ++i) {
+        RtQ* e = &g_rtQ[(h + i) & (RT_QC - 1)];
+        if (!e->valid) {
+            if (slen) { if (!g_rtQStr || g_rtQStrTop + (DWORD)slen > RT_QSTR) return NULL; memcpy(g_rtQStr + g_rtQStrTop, str, slen); e->soff = g_rtQStrTop; g_rtQStrTop += slen; }
+            e->fx = fx; e->slot = (WORD)slot; e->a0 = a0; e->a1 = a1; e->slen = (WORD)slen; return e;
+        }
+    }
+    return NULL;
+}
+static void rtQForget(DWORD fx) { if (g_rtQ) for (int i = 0; i < RT_QC; ++i) if (g_rtQ[i].fx == fx) g_rtQ[i].valid = 0; }   // keep fx as tombstone
+static int rtQStr(DWORD s, DWORD* hash) {               // -1 = not cacheable
+    if (!s) return -1;
+    __try {
+        const char* p = (const char*)(ULONG_PTR)s; DWORD h = 2166136261u; int n = 0;
+        for (; n < 1000 && p[n]; ++n) h = (h ^ (BYTE)p[n]) * 16777619u;
+        if (p[n]) return -1;
+        *hash = h; return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+typedef DWORD (__stdcall* RtFx1)(void*, DWORD);
+typedef DWORD (__stdcall* RtFx2)(void*, DWORD, DWORD);
+static DWORD rtQSync1(void* self, int slot, DWORD x) { RT_SYNC(fx, slot, 120 + slot, RtFx1, self, x); return 0; }
+static DWORD rtQSync2(void* self, int slot, DWORD x, DWORD y) { RT_SYNC(fx, slot, 120 + slot, RtFx2, self, x, y); return 0; }
+static DWORD rtQDesc0(void* self, int slot, DWORD pDesc, int bytes) {                 // GetDesc(pDesc)
+    DWORD fx = (DWORD)(ULONG_PTR)self;
+    if (!pDesc) return rtQSync1(self, slot, pDesc);
+    RtQ* e = rtQFind(fx, slot, 0, 0, NULL, 0);
+    if (e) { memcpy((void*)(ULONG_PTR)pDesc, e->out, bytes); g_rtQHit++; return e->ret; }
+    DWORD hr = rtQSync1(self, slot, pDesc); g_rtQMiss++;
+    if ((LONG)hr >= 0 && (e = rtQNew(fx, slot, 0, 0, NULL, 0)) != NULL) { memcpy(e->out, (void*)(ULONG_PTR)pDesc, bytes); e->ret = hr; e->valid = 1; }
+    return hr;
+}
+static DWORD rtQDesc1(void* self, int slot, DWORD h, DWORD pDesc, int bytes) {        // Get*Desc(handle, pDesc)
+    DWORD fx = (DWORD)(ULONG_PTR)self;
+    if (!pDesc || rtIsName(h)) return rtQSync2(self, slot, h, pDesc);
+    RtQ* e = rtQFind(fx, slot, h, 0, NULL, 0);
+    if (e) { memcpy((void*)(ULONG_PTR)pDesc, e->out, bytes); g_rtQHit++; return e->ret; }
+    DWORD hr = rtQSync2(self, slot, h, pDesc); g_rtQMiss++;
+    if ((LONG)hr >= 0 && (e = rtQNew(fx, slot, h, 0, NULL, 0)) != NULL) { memcpy(e->out, (void*)(ULONG_PTR)pDesc, bytes); e->ret = hr; e->valid = 1; }
+    return hr;
+}
+static DWORD rtQVal1(void* self, int slot, DWORD idx) {                                // GetTechnique(i), GetFunction(i)
+    DWORD fx = (DWORD)(ULONG_PTR)self;
+    RtQ* e = rtQFind(fx, slot, idx, 0, NULL, 0);
+    if (e) { g_rtQHit++; return e->ret; }
+    DWORD r = rtQSync1(self, slot, idx); g_rtQMiss++;
+    if ((e = rtQNew(fx, slot, idx, 0, NULL, 0)) != NULL) { e->ret = r; e->valid = 1; }
+    return r;
+}
+// ---------------------------------------------------------------- GetInt on annotation handles
+// Annotations are fixed effect metadata; the engine reads the int annotation "MaxSkinningBones" whenever it sets up a
+// skinned mesh, and every read was a synchronous queue drain. Handles returned by GetAnnotation / GetAnnotationByName
+// are recorded per effect; the first GetInt on such a handle runs synchronously and its result is kept, later reads
+// return it. Everything recorded for an effect is forgotten on any Release of that effect.
+struct RtAnn { DWORD fx, h, val, hr; BYTE state, pad[3]; };      // state 1: annotation handle, 2: value kept
+#define RT_ANN 1024
+static RtAnn g_rtAnn[RT_ANN];
+static volatile LONG g_rtNAnnHit = 0;
+static RtAnn* rtAnnSlot(DWORD fx, DWORD h, bool create) {
+    DWORD k = ((fx * 2654435761u) ^ (h * 2246822519u)) >> 22;
+    for (int i = 0; i < 8; ++i) {
+        RtAnn& a = g_rtAnn[(k + i) & (RT_ANN - 1)];
+        if (a.state && a.fx == fx && a.h == h) return &a;
+        if (!a.state) { if (!create) return NULL; a.fx = fx; a.h = h; a.state = 1; return &a; }
+    }
+    return NULL;
+}
+static void rtAnnNote(DWORD fx, DWORD h) { if (h && !rtIsName(h)) rtAnnSlot(fx, h, true); }
+static void rtAnnForget(DWORD fx) { for (int i = 0; i < RT_ANN; ++i) if (g_rtAnn[i].state && g_rtAnn[i].fx == fx) g_rtAnn[i].state = 0; }
+static DWORD rtQVal2(void* self, int slot, DWORD h, DWORD idx);
+static DWORD rtQVal2Ann(void* self, int slot, DWORD h, DWORD idx);
+static DWORD rtQVal2(void* self, int slot, DWORD h, DWORD idx) {                       // GetParameter/Element/Pass/Annotation(h, i), IsParameterUsed(h, h)
+    if (slot == 18) { DWORD r = rtQVal2Ann(self, slot, h, idx); rtAnnNote((DWORD)(ULONG_PTR)self, r); return r; }
+    return rtQVal2Ann(self, slot, h, idx);
+}
+static DWORD rtQVal2Ann(void* self, int slot, DWORD h, DWORD idx) {
+    DWORD fx = (DWORD)(ULONG_PTR)self;
+    if (rtIsName(h) || (slot == 62 && rtIsName(idx))) return rtQSync2(self, slot, h, idx);
+    RtQ* e = rtQFind(fx, slot, h, idx, NULL, 0);
+    if (e) { g_rtQHit++; return e->ret; }
+    DWORD r = rtQSync2(self, slot, h, idx); g_rtQMiss++;
+    if ((e = rtQNew(fx, slot, h, idx, NULL, 0)) != NULL) { e->ret = r; e->valid = 1; }
+    return r;
+}
+static DWORD rtQStr1(void* self, int slot, DWORD name) {                               // GetTechniqueByName, GetFunctionByName
+    DWORD fx = (DWORD)(ULONG_PTR)self, sh = 0; int n = rtQStr(name, &sh);
+    if (n < 0) return rtQSync1(self, slot, name);
+    RtQ* e = rtQFind(fx, slot, 0, sh, (const char*)(ULONG_PTR)name, n);
+    if (e) { g_rtQHit++; return e->ret; }
+    DWORD r = rtQSync1(self, slot, name); g_rtQMiss++;
+    if ((e = rtQNew(fx, slot, 0, sh, (const char*)(ULONG_PTR)name, n)) != NULL) { e->ret = r; e->valid = 1; }
+    return r;
+}
+static DWORD rtQStr2Ann(void* self, int slot, DWORD h, DWORD name);
+static DWORD rtQStr2(void* self, int slot, DWORD h, DWORD name) {
+    DWORD r = rtQStr2Ann(self, slot, h, name);
+    if (slot == 19) rtAnnNote((DWORD)(ULONG_PTR)self, r);
+    return r;
+}
+static DWORD rtQStr2Ann(void* self, int slot, DWORD h, DWORD name) {                   // GetParameterByName/BySemantic, GetPassByName, GetAnnotationByName
+    DWORD fx = (DWORD)(ULONG_PTR)self, sh = 0, ka0 = h; int n; char kb[2016]; const char* key = (const char*)(ULONG_PTR)name;
+    if (rtIsName(h)) {                                  // parent given by name: key = parent \x01 name
+        DWORD ph = 0; int pn = rtQStr(h, &ph); n = rtQStr(name, &sh);
+        if (pn < 0 || n < 0) return rtQSync2(self, slot, h, name);
+        memcpy(kb, (const char*)(ULONG_PTR)h, pn); kb[pn] = 1; memcpy(kb + pn + 1, key, n);
+        key = kb; n = pn + 1 + n; sh = sh * 16777619u ^ ph; ka0 = 0xFFFFFFFFu;
+    } else n = rtQStr(name, &sh);
+    if (n < 0) return rtQSync2(self, slot, h, name);
+    RtQ* e = rtQFind(fx, slot, ka0, sh, key, n);
+    if (e) { g_rtQHit++; return e->ret; }
+    DWORD r = rtQSync2(self, slot, h, name); g_rtQMiss++;
+    if ((e = rtQNew(fx, slot, ka0, sh, key, n)) != NULL) { e->ret = r; e->valid = 1; }
+    return r;
+}
+#define RT_FXQ_PRE(SLOT, SIG, ...) DWORD tid = __readfsdword(0x24); \
+    if (!g_rtActive && !g_rtTried && rtIsGameThread(tid) && !g_rtXDepth) rtInstall(self); \
+    RT_PASSTHRU(fx, SLOT, SIG, __VA_ARGS__)
+static DWORD __stdcall rt_fx_3(void* self, DWORD a0)            { RT_FXQ_PRE(3, RtFx1, self, a0);  return rtQDesc0(self, 3, a0, 16); }
+static DWORD __stdcall rt_fx_4(void* self, DWORD a0, DWORD a1)  { RT_FXQ_PRE(4, RtFx2, self, a0, a1); return rtQDesc1(self, 4, a0, a1, 44); }
+static DWORD __stdcall rt_fx_5(void* self, DWORD a0, DWORD a1)  { RT_FXQ_PRE(5, RtFx2, self, a0, a1); return rtQDesc1(self, 5, a0, a1, 12); }
+static DWORD __stdcall rt_fx_6(void* self, DWORD a0, DWORD a1)  { RT_FXQ_PRE(6, RtFx2, self, a0, a1); return rtQDesc1(self, 6, a0, a1, 16); }
+static DWORD __stdcall rt_fx_7(void* self, DWORD a0, DWORD a1)  { RT_FXQ_PRE(7, RtFx2, self, a0, a1); return rtQDesc1(self, 7, a0, a1, 8); }
+static DWORD __stdcall rt_fx_8(void* self, DWORD a0, DWORD a1)  { RT_FXQ_PRE(8, RtFx2, self, a0, a1); return rtQVal2(self, 8, a0, a1); }
+static DWORD __stdcall rt_fx_9(void* self, DWORD a0, DWORD a1)  { RT_FXQ_PRE(9, RtFx2, self, a0, a1); return rtQStr2(self, 9, a0, a1); }
+static DWORD __stdcall rt_fx_10(void* self, DWORD a0, DWORD a1) { RT_FXQ_PRE(10, RtFx2, self, a0, a1); return rtQStr2(self, 10, a0, a1); }
+static DWORD __stdcall rt_fx_11(void* self, DWORD a0, DWORD a1) { RT_FXQ_PRE(11, RtFx2, self, a0, a1); return rtQVal2(self, 11, a0, a1); }
+static DWORD __stdcall rt_fx_12(void* self, DWORD a0)           { RT_FXQ_PRE(12, RtFx1, self, a0); return rtQVal1(self, 12, a0); }
+static DWORD __stdcall rt_fx_13(void* self, DWORD a0)           { RT_FXQ_PRE(13, RtFx1, self, a0); return rtQStr1(self, 13, a0); }
+static DWORD __stdcall rt_fx_14(void* self, DWORD a0, DWORD a1) { RT_FXQ_PRE(14, RtFx2, self, a0, a1); return rtQVal2(self, 14, a0, a1); }
+static DWORD __stdcall rt_fx_15(void* self, DWORD a0, DWORD a1) { RT_FXQ_PRE(15, RtFx2, self, a0, a1); return rtQStr2(self, 15, a0, a1); }
+static DWORD __stdcall rt_fx_16(void* self, DWORD a0)           { RT_FXQ_PRE(16, RtFx1, self, a0); return rtQVal1(self, 16, a0); }
+static DWORD __stdcall rt_fx_17(void* self, DWORD a0)           { RT_FXQ_PRE(17, RtFx1, self, a0); return rtQStr1(self, 17, a0); }
+static DWORD __stdcall rt_fx_18(void* self, DWORD a0, DWORD a1) { RT_FXQ_PRE(18, RtFx2, self, a0, a1); return rtQVal2(self, 18, a0, a1); }
+static DWORD __stdcall rt_fx_19(void* self, DWORD a0, DWORD a1) { RT_FXQ_PRE(19, RtFx2, self, a0, a1); return rtQStr2(self, 19, a0, a1); }
+static DWORD __stdcall rt_fx_27(void* self, DWORD a0, DWORD a1) {                             // GetInt: kept for annotation handles
+    RT_FXQ_PRE(27, RtFx2, self, a0, a1);
+    RtAnn* an = a1 ? rtAnnSlot((DWORD)(ULONG_PTR)self, a0, false) : NULL;
+    if (an && an->state == 2) { *(DWORD*)(ULONG_PTR)a1 = an->val; g_rtNAnnHit++; return an->hr; }
+    rtSyncNote(147, (DWORD)(ULONG_PTR)_ReturnAddress()); g_rtCurOp = 147;
+    rtDrain(); EnterCriticalSection(&g_rtExecCs); g_rtDirectScope++;
+    DWORD r = ((DWORD(__stdcall*)(void*, DWORD, DWORD))g_rtO_fx[27])(self, a0, a1);
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); g_rtNSync++; g_rtSyncHist[147]++;
+    if (an && (LONG)r >= 0) { an->val = *(DWORD*)(ULONG_PTR)a1; an->hr = r; an->state = 2; }
+    return r;
+}
+static DWORD __stdcall rt_fx_62(void* self, DWORD a0, DWORD a1) { RT_FXQ_PRE(62, RtFx2, self, a0, a1); return rtQVal2(self, 62, a0, a1); }
+
+// ---------------------------------------------------------------- parameter blocks through the queue (proxy handles)
+// The engine rebuilds material parameter blocks during battles (Delete, Begin, Set*, End); each synchronous
+// Begin/End used to wait for the whole queue.
+static BYTE* g_rtPBLive = NULL;                         // game thread: proxy index handed out and not yet deleted
+static DWORD g_rtPBFree[RT_PBN]; static int g_rtPBNFree = 0; static DWORD g_rtPBNext = 1;
+static volatile LONG g_rtNPBProxy = 0;
+static DWORD rtPBAlloc() {
+    if (!g_rtPBReal || !g_rtPBLive) return 0;
+    DWORD idx = g_rtPBNFree ? g_rtPBFree[--g_rtPBNFree] : (g_rtPBNext < RT_PBN ? g_rtPBNext++ : 0);
+    if (idx) g_rtPBLive[idx] = 1;
+    return idx;
+}
+static void rtPBRelease(DWORD idx) { g_rtPBLive[idx] = 0; if (g_rtPBNFree < (int)RT_PBN) g_rtPBFree[g_rtPBNFree++] = idx; }
+static DWORD __stdcall rt_fx_73(void* self) {                                                    // BeginParameterBlock
+    g_rtFxRecording = 1;                                                                         // recorded: nothing may be skipped, and the handles are collected
+    g_rtFxBlkRec.n = 0; g_rtFxBlkRec.known = 1;
+    RT_FXQ_PRE(73, RtS1, self);
+    RtRec* r = rtAlloc(1, 0); r->fn = g_rtO_fx[73]; r->op = 193; rtArgs(r)[0] = (DWORD)(ULONG_PTR)self;
+    rtCommit(r, 0); return 0;
+}
+static DWORD __stdcall rt_fx_74(void* self) {                                                    // EndParameterBlock -> proxy handle
+    g_rtFxRecording = 0;
+    RT_FXQ_PRE(74, RtS1, self);
+    DWORD idx = rtPBAlloc();
+    if (!idx) { rtFxInvalAll(); RT_SYNC(fx, 74, 194, RtS1, self); }                             // table exhausted: real handle, and the block's handles stay unknown
+    if (g_rtFxBlk) g_rtFxBlk[idx] = g_rtFxBlkRec;
+    RtRec* r = rtAlloc(2, 0); r->kind = 5; r->fn = g_rtO_fx[74]; r->op = 194;
+    DWORD* A = rtArgs(r); A[0] = (DWORD)(ULONG_PTR)self; A[1] = idx;
+    rtCommit(r, 0); g_rtNPBProxy++;
+    return 0xFFFF0003u | (idx << 2);
+}
+static DWORD __stdcall rt_fx_75(void* self, DWORD a0) {                                          // ApplyParameterBlock
+    if (rtIsPBProxy(a0)) rtFxBlkApply(rtPBIndex(a0)); else rtFxInvalAll(1);                       // only what the block sets
+    RT_FXQ_PRE(75, RtS2, self, rtPBReal(a0));                                                    // outside the queue: the real handle
+    RtRec* r;
+    if (rtIsPBProxy(a0)) { r = rtAlloc(3, 0); r->kind = 6; r->fn = g_rtO_fx[75]; r->op = 195; DWORD* A = rtArgs(r); A[0] = (DWORD)(ULONG_PTR)self; A[1] = rtPBIndex(a0); A[2] = 0; }
+    else { r = rtAlloc(2, 0); r->fn = g_rtO_fx[75]; r->op = 195; DWORD* A = rtArgs(r); A[0] = (DWORD)(ULONG_PTR)self; A[1] = a0; }
+    rtCommit(r, 0); return 0;
+}
+static DWORD __stdcall rt_fx_76(void* self, DWORD a0) {                                          // DeleteParameterBlock
+    DWORD tid = __readfsdword(0x24);
+    if (!g_rtActive && !g_rtTried && rtIsGameThread(tid) && !g_rtXDepth) rtInstall(self);
+    bool proxy = rtIsPBProxy(a0) && g_rtPBReal && g_rtPBLive;
+    if (tid != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) {
+        DWORD real = rtPBReal(a0), hr;
+        if (g_rtActive && tid != g_rtWorkerTid && tid != g_rtMainTid) { EnterCriticalSection(&g_rtExecCs); hr = ((RtS2)g_rtO_fx[76])(self, real); LeaveCriticalSection(&g_rtExecCs); }
+        else hr = ((RtS2)g_rtO_fx[76])(self, real);
+        if (proxy && tid == g_rtMainTid && g_rtPBLive[rtPBIndex(a0)]) { g_rtPBReal[rtPBIndex(a0)] = 0; rtPBRelease(rtPBIndex(a0)); }
+        return hr;
+    }
+    RtRec* r;
+    if (proxy) {
+        DWORD idx = rtPBIndex(a0);
+        if (!g_rtPBLive[idx]) return 0x8876086Cu;                                                // already deleted: D3DERR_INVALIDCALL, nothing queued
+        r = rtAlloc(3, 0); r->kind = 6; r->fn = g_rtO_fx[76]; r->op = 196; DWORD* A = rtArgs(r); A[0] = (DWORD)(ULONG_PTR)self; A[1] = idx; A[2] = 1;
+        rtCommit(r, 0); rtPBRelease(idx); return 0;
+    }
+    r = rtAlloc(2, 0); r->fn = g_rtO_fx[76]; r->op = 196; DWORD* A = rtArgs(r); A[0] = (DWORD)(ULONG_PTR)self; A[1] = a0;
+    rtCommit(r, 0); return 0;
+}
+
+#include "aotr_rtmirror.inc"
+
+// ---------------------------------------------------------------- engine per-pixel surface writes (radar blips)
+// SurfaceClass::DrawPixel (0x5165E0) and its alpha twin (0x5166C0) do GetDesc + LockRect(1x1) + write + UnlockRect
+// for every pixel - ~650 synchronous queue drains per battle frame for the minimap. The description is immutable,
+// so it is read on the game thread; the lock, the write and the unlock become one record the worker executes in
+// queue order, exactly as the engine would have.
+typedef void (__fastcall* tRtPixelFn)(DWORD* sc, void* edx, DWORD x, DWORD y, DWORD v);
+static tRtPixelFn o_rtDrawPixel = NULL, o_rtSetAlpha = NULL;
+static volatile LONG g_rtNPixel = 0;
+static void rtPixelRecord(DWORD surf, DWORD x, DWORD y, DWORD v, DWORD mode) {
+    RtRec* r = rtAlloc(6, 0); r->kind = 4; r->fn = g_rtO_surf[13]; r->op = 303;
+    DWORD* A = rtArgs(r); A[0] = surf; A[1] = x; A[2] = y; A[3] = v; A[4] = mode; A[5] = (DWORD)(ULONG_PTR)g_rtO_surf[14];
+    rtTouch(surf); rtCommit(r, 0); g_rtNPixel++;
+}
+// v38: test-19 had ~25% of this DLL's game-thread time in these two hooks (a record, a seq and a publish per pixel of the
+// minimap). A run of pixels to one surface is now one record; the worker still locks, writes and unlocks every pixel
+// one by one in the order they came, and nothing else can be queued in the middle of a run (rtAlloc and every wait
+// close it first), so the device sees exactly the calls it saw before. Off: a file PXBATCH_OFF next to the DLL.
+static LONG g_rtPxOn = 1;
+static void rtPxClose() {
+    RtRec* r = g_rtPxRec; g_rtPxRec = NULL;
+    DWORD n = g_rtPxN;
+    r->pad = n;
+    rtCommit(r, n * 16);
+    if (n > 1) { g_rtPH.unpublished += n - 1; if (g_rtPH.unpublished >= 32) rtPublish(); }   // the publish cadence stays in pixels
+    g_rtNPxBatch++; g_rtNPxEntry += (LONG)n;
+}
+static void rtPixelAdd(DWORD surf, DWORD x, DWORD y, DWORD v, DWORD mode) {
+    if (!g_rtPxOn) { rtPixelRecord(surf, x, y, v, mode); return; }
+    if (g_rtPxRec && (g_rtPxSurf != surf || g_rtPxN >= RT_PX_MAXN)) rtPxClose();
+    if (!g_rtPxRec) {
+        RtRec* r = rtAlloc(2, RT_PX_MAXN * 16);
+        r->kind = 10; r->fn = g_rtO_surf[13]; r->op = 303;
+        DWORD* A = rtArgs(r); A[0] = surf; A[1] = (DWORD)(ULONG_PTR)g_rtO_surf[14];
+        rtTouch(surf);                                   // the run is the next record committed (nothing can be queued before it closes)
+        g_rtPxRec = r; g_rtPxBase = (DWORD*)rtPayload(r); g_rtPxN = 0; g_rtPxSurf = surf;
+    }
+    DWORD* e = g_rtPxBase + g_rtPxN * 4; e[0] = x; e[1] = y; e[2] = v; e[3] = mode;
+    g_rtPxN++; g_rtNPixel++;
+}
+static void __fastcall hk_rtDrawPixel(DWORD* sc, void* edx, DWORD x, DWORD y, DWORD color) {
+    if (__readfsdword(0x24) != g_rtMainTid || !g_rtActive || g_rtDirectScope || !sc || !sc[0]) {
+        if (g_rtPxRec && __readfsdword(0x24) == g_rtMainTid && g_rtActive) rtDrain();   // v38: an open run goes first
+        o_rtDrawPixel(sc, edx, x, y, color); return; }
+    DWORD desc[3] = {0, 0, 0};
+    ((void (__fastcall*)(DWORD*, void*, DWORD*))(ULONG_PTR)0x00515FD0)(sc, NULL, desc);          // SurfaceClass::Get_Description
+    DWORD bpp = (DWORD)((int (__fastcall*)(DWORD*, void*))(ULONG_PTR)0x00515F10)(desc, NULL);     // bytes per pixel of that format
+    if (g_rtTMAny) rtTMPixel(sc[0], x, y, color, bpp);
+    rtPixelAdd(sc[0], x, y, color, bpp);
+}
+static void __fastcall hk_rtSetAlpha(DWORD* sc, void* edx, DWORD x, DWORD y, DWORD alpha) {
+    if (__readfsdword(0x24) != g_rtMainTid || !g_rtActive || g_rtDirectScope || !sc || !sc[0]) {
+        if (g_rtPxRec && __readfsdword(0x24) == g_rtMainTid && g_rtActive) rtDrain();   // v38: an open run goes first
+        o_rtSetAlpha(sc, edx, x, y, alpha); return; }
+    DWORD desc[3] = {0, 0, 0};
+    ((void (__fastcall*)(DWORD*, void*, DWORD*))(ULONG_PTR)0x00515FD0)(sc, NULL, desc);
+    if (g_rtTMAny) rtTMPixel(sc[0], x, y, alpha, desc[0] == 21 ? 0x100u : 0u);
+    rtPixelAdd(sc[0], x, y, alpha, desc[0] == 21 ? 0x100u : 0u);                                  // alpha byte of A8R8G8B8 only
+}
+// W3DShroud-style texture updates (0x472EF4 16-bit, 0x473E?? 32-bit) lock a rect of a MANAGED texture through
+// SurfaceClass::Lock(pitch, l, t, r, b) (0x516090), memcpy every row of the rect from the CPU shroud buffer and unlock
+// (0x516110). At those two call-site pairs only, the rect goes to a staging buffer with pitch = width * bytes per pixel
+// and the unlock queues LockRect + row copies + UnlockRect for the worker - the same lock, the same bytes, in order.
+struct RtShrStage { DWORD* sc; DWORD surf, l, t, r, b, bpp, cap; BYTE* mem; };
+static RtShrStage g_rtShr[4];
+static int g_rtNShr = 0;
+static volatile LONG g_rtNShroud = 0;
+typedef void* (__fastcall* tRtSurfLock)(DWORD*, void*, int*, DWORD, DWORD, DWORD, DWORD);
+typedef void  (__fastcall* tRtSurfUnlock)(DWORD*, void*);
+static const DWORD kSurfLockRect = 0x00516090, kSurfUnlock = 0x00516110;
+static void* __fastcall hk_rtShroudLock(DWORD* sc, void* edx, int* pitch, DWORD l, DWORD t, DWORD r, DWORD b) {
+    tRtSurfLock orig = (tRtSurfLock)(ULONG_PTR)kSurfLockRect;
+    if (g_rtTMAny && sc && sc[0]) rtTMKill(sc[0]);
+    if (__readfsdword(0x24) != g_rtMainTid || !g_rtActive || g_rtDirectScope || !sc || !sc[0] || !pitch || r <= l || b <= t || g_rtNShr >= 4)
+        return orig(sc, edx, pitch, l, t, r, b);
+    BYTE desc[32];
+    if ((LONG)((RtS2)g_rtO_surf[12])((void*)(ULONG_PTR)sc[0], (DWORD)(ULONG_PTR)desc) < 0) return orig(sc, edx, pitch, l, t, r, b);
+    const DWORD* d = (const DWORD*)desc;                // Format Type Usage Pool MSType MSQuality Width Height
+    DWORD bpp = (d[0] == 21 || d[0] == 22) ? 4u : ((d[0] >= 23 && d[0] <= 26) ? 2u : 0u);
+    DWORD w = r - l, h = b - t;
+    if (!bpp || r > d[6] || b > d[7] || w > 4096 || h > 4096) return orig(sc, edx, pitch, l, t, r, b);
+    DWORD bytes = w * h * bpp;
+    RtShrStage& st = g_rtShr[g_rtNShr];
+    if (st.cap < bytes) {
+        if (st.mem) VirtualFree(st.mem, 0, MEM_RELEASE);
+        st.mem = (BYTE*)VirtualAlloc(NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); st.cap = st.mem ? bytes : 0;
+        if (!st.mem) return orig(sc, edx, pitch, l, t, r, b);
+    }
+    st.sc = sc; st.surf = sc[0]; st.l = l; st.t = t; st.r = r; st.b = b; st.bpp = bpp;
+    g_rtNShr++;
+    *pitch = (int)(w * bpp);
+    return st.mem;
+}
+static void __fastcall hk_rtShroudUnlock(DWORD* sc, void* edx) {
+    for (int i = g_rtNShr - 1; i >= 0; --i) {
+        if (g_rtShr[i].sc != sc) continue;
+        RtShrStage st = g_rtShr[i];
+        g_rtShr[i] = g_rtShr[g_rtNShr - 1]; g_rtShr[g_rtNShr - 1] = st;        // keep the buffer with its slot
+        g_rtShr[g_rtNShr - 1].sc = NULL; g_rtNShr--;
+        DWORD bytes = (st.r - st.l) * (st.b - st.t) * st.bpp;
+        RtRec* rec = rtAlloc(9, bytes); rec->kind = 7; rec->op = 304;
+        DWORD* A = rtArgs(rec); BYTE* P = rtPayload(rec); DWORD po = 0;
+        A[0] = st.surf; A[1] = st.l; A[2] = st.t; A[3] = st.r; A[4] = st.b; A[5] = st.bpp;
+        A[6] = rtBytes(P, &po, (DWORD)(ULONG_PTR)st.mem, bytes);
+        A[7] = (DWORD)(ULONG_PTR)g_rtO_surf[13]; A[8] = (DWORD)(ULONG_PTR)g_rtO_surf[14];
+        rtTouch(st.surf); rtCommit(rec, po); g_rtNShroud++;
+        return;
+    }
+    ((tRtSurfUnlock)(ULONG_PTR)kSurfUnlock)(sc, edx);
+}
+static bool rtCallTo(DWORD site, DWORD target) {
+    const BYTE* q = (const BYTE*)(ULONG_PTR)site;
+    return q[0] == 0xE8 && site + 5 + *(const DWORD*)(q + 1) == target;
+}
+static void rtSetCall(DWORD site, void* hook) {
+    BYTE* q = (BYTE*)(ULONG_PTR)site; DWORD op = 0;
+    VirtualProtect(q, 5, PAGE_EXECUTE_READWRITE, &op);
+    *(DWORD*)(q + 1) = (DWORD)(ULONG_PTR)hook - (site + 5);
+    VirtualProtect(q, 5, op, &op);
+    FlushInstructionCache(GetCurrentProcess(), q, 5);
+}
+static void rtInstallShroudHooks() {
+    static const DWORD kSites[4][2] = { {0x0047308C, kSurfLockRect}, {0x004730C0, kSurfUnlock}, {0x00473EB3, kSurfLockRect}, {0x00473EE8, kSurfUnlock} };
+    // the row loops between them: 16-bit (add ebx,ebx / memcpy) and 32-bit (shl ebx,2 / memcpy)
+    static const BYTE kLoop16[] = {0x03,0xDB}, kLoop32[] = {0xC1,0xE3,0x02};
+    __try {
+        for (int i = 0; i < 4; ++i) if (!rtCallTo(kSites[i][0], kSites[i][1])) { logf("rt: shroud texture call sites differ - shroud updates stay synchronous."); return; }
+        if (memcmp((void*)0x0047309B, kLoop16, 2) || memcmp((void*)0x00473EC2, kLoop32, 3)) { logf("rt: shroud row loops differ - shroud updates stay synchronous."); return; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    HANDLE fz[256]; int nf = 0;
+    suspendOthers(fz, &nf, 256);
+    rtSetCall(0x0047308C, (void*)&hk_rtShroudLock); rtSetCall(0x004730C0, (void*)&hk_rtShroudUnlock);
+    rtSetCall(0x00473EB3, (void*)&hk_rtShroudLock); rtSetCall(0x00473EE8, (void*)&hk_rtShroudUnlock);
+    resumeAll(fz, nf);
+    logf("rt: shroud texture updates (0x47308C/0x473EB3) go through the queue.");
+}
+static void rtInstallPixelHooks() {
+    static const BYTE kPre[]  = {0x83,0xEC,0x24,0x56,0x8B,0xF1,0x83,0x3E,0x00,0x0F,0x84};
+    static const BYTE kDesc[] = {0x83,0xEC,0x20,0x33,0xC0,0x89,0x04,0x24};
+    static const BYTE kBpp[]  = {0x8B,0x09,0x83,0xC1,0xEC,0x33,0xC0};
+    __try {
+        if (memcmp((void*)0x005165E0, kPre, sizeof(kPre)) || memcmp((void*)0x005166C0, kPre, sizeof(kPre)) ||
+            memcmp((void*)0x00515FD0, kDesc, sizeof(kDesc)) || memcmp((void*)0x00515F10, kBpp, sizeof(kBpp))) {
+            logf("rt: engine per-pixel surface functions differ - pixel writes stay synchronous."); return;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    o_rtDrawPixel = (tRtPixelFn)makeTrampoline((BYTE*)0x005165E0, 6);
+    o_rtSetAlpha  = (tRtPixelFn)makeTrampoline((BYTE*)0x005166C0, 6);
+    if (!o_rtDrawPixel || !o_rtSetAlpha) return;
+    HANDLE fz[256]; int nf = 0;
+    suspendOthers(fz, &nf, 256);
+    patchJmp((BYTE*)0x005165E0, (void*)&hk_rtDrawPixel, 6);
+    patchJmp((BYTE*)0x005166C0, (void*)&hk_rtSetAlpha, 6);
+    resumeAll(fz, nf);
+    { char mk[MAX_PATH]; if (GetFileAttributesA(aotrPath(mk, "PXBATCH_OFF")) != INVALID_FILE_ATTRIBUTES) g_rtPxOn = 0; }
+    logf("rt: engine per-pixel surface writes (DrawPixel 0x5165E0, alpha 0x5166C0) go through the queue%s.", g_rtPxOn ? " - a run of them to one surface as one record (v38; each pixel still locked, written and unlocked on its own)" : " - one record each (PXBATCH_OFF)");
+}
+static void rtInstallEngineHooks() { rtInstallPixelHooks(); rtInstallShroudHooks(); rtInstallTexMirrors(); }
+
+// ---------------------------------------------------------------- staged write-only buffer locks
+// DISCARD / NOOVERWRITE locks on vertex and index buffers (hundreds per frame: particles, UI, terrain) used
+// to drain the queue. The game now writes into staging memory; at Unlock one record carries the bytes and
+// the worker does Lock + copy + Unlock in queue order. Read or plain locks stay synchronous.
+#define RT_ARENA_SIZE (64u << 20)
+static BYTE* g_rtArena = NULL;
+static DWORD g_rtArenaTop = 0;
+// CPU mirrors for plain buffer locks: a lock without DISCARD / NOOVERWRITE / READONLY must show the buffer's current
+// bytes, so it used to drain the queue. The first such lock of a buffer reads the whole buffer once (synchronously) into
+// a mirror and keeps a reference to the buffer; later plain locks get staging memory filled from the mirror, and every
+// staged unlock of the buffer (plain or NOOVERWRITE) writes the staged bytes into the mirror as it queues them. A
+// DISCARD lock, any lock outside this path (another thread, a scoped D3DX call) or a Reset drops the mirror first.
+struct RtBufMir { DWORD buf, len, cap, lastFrame; BYTE* mem; BYTE live, dead, isIB, pad; };
+#define RT_BMIR 384
+#define RT_BMIX 1024                                              // pointer -> mirror index (open addressing)
+#define RT_BM_BYTES (320u << 20)                                  // mirror memory ceiling
+static RtBufMir g_rtBM[RT_BMIR];
+static short g_rtBMIx[RT_BMIX];                                   // slot + 1, 0 = empty
+static DWORD g_rtBMBytes = 0, g_rtBMReapFrame = 0;
+static volatile LONG g_rtNBMAdopt = 0, g_rtNBMLock = 0, g_rtNBMDrop = 0, g_rtNBMFail = 0, g_rtNBMEvict = 0;
+static volatile LONG g_rtBufFallback[9];                          // 0 readonly, 1 no ptr, 2 stages full, 3 desc, 4 range, 5 arena, 6 no mirror, 7 other
+static __forceinline DWORD rtBMHash(DWORD b) { return (b * 2654435761u) >> 22; }
+static RtBufMir* rtBMFind(DWORD b) {
+    DWORD h = rtBMHash(b);
+    for (int i = 0; i < 16; ++i) {
+        short e = g_rtBMIx[(h + i) & (RT_BMIX - 1)];
+        if (!e) return NULL;
+        RtBufMir& m = g_rtBM[e - 1];
+        if (m.buf == b && m.live && !m.dead) return &m;           // a dead mirror of the same buffer may still sit earlier in the chain
+    }
+    return NULL;
+}
+static void rtBMIndexRebuild() {
+    memset(g_rtBMIx, 0, sizeof(g_rtBMIx));
+    for (int i = 0; i < RT_BMIR; ++i) {
+        if (!g_rtBM[i].live) continue;
+        DWORD h = rtBMHash(g_rtBM[i].buf);
+        for (int k = 0; k < 16; ++k) { short& e = g_rtBMIx[(h + k) & (RT_BMIX - 1)]; if (!e) { e = (short)(i + 1); break; } }
+    }
+}
+static LONG g_rtBMDead = 0;
+static void rtBMKill(DWORD b) { RtBufMir* m = rtBMFind(b); if (m) { m->dead = 1; g_rtNBMDrop++; g_rtBMDead++; } }
+static void rtBMKillAll() { for (int i = 0; i < RT_BMIR; ++i) if (g_rtBM[i].live && !g_rtBM[i].dead) { g_rtBM[i].dead = 1; g_rtNBMDrop++; g_rtBMDead++; } }
+struct RtStage { DWORD buf, off, size, flags; BYTE* mem; RtBufMir* mir; };
+#define RT_STG 256
+static RtStage g_rtStage[RT_STG];
+static int g_rtNStage = 0;
+static bool rtBMPending(const RtBufMir* m) { for (int k = 0; k < g_rtNStage; ++k) if (g_rtStage[k].mir == m) return true; return false; }
+static void rtBMRelease(RtBufMir& m) {                            // game thread: give the kept reference back through the queue
+    m.live = 0; m.dead = 0;
+    if (m.isIB) rt_ib_2((void*)(ULONG_PTR)m.buf); else rt_vb_2((void*)(ULONG_PTR)m.buf);
+}
+static void rtBMReap() {                                          // once a frame (or when mirrors died): release dead mirrors and ones idle for a minute
+    if (g_rtBMReapFrame == (DWORD)g_mkFrames && !g_rtBMDead) return;
+    g_rtBMReapFrame = (DWORD)g_mkFrames;
+    bool changed = false; LONG left = 0;
+    for (int i = 0; i < RT_BMIR; ++i) {
+        RtBufMir& m = g_rtBM[i];
+        if (!m.live || !(m.dead || (DWORD)(g_mkFrames - m.lastFrame) > 1800)) continue;
+        if (rtBMPending(&m)) { if (m.dead) left++; continue; }
+        rtBMRelease(m); changed = true;
+    }
+    g_rtBMDead = left;
+    if (changed) rtBMIndexRebuild();
+}
+static int rtBMFreeSlot(DWORD need) {                             // a free slot with room for need bytes, evicting the least recently locked mirrors
+    for (int round = 0; round < RT_BMIR; ++round) {
+        int slot = -1;
+        for (int i = 0; i < RT_BMIR; ++i) if (!g_rtBM[i].live) { slot = i; break; }
+        DWORD have = slot >= 0 ? g_rtBM[slot].cap : 0;
+        if (slot >= 0 && g_rtBMBytes - have + need <= RT_BM_BYTES) return slot;
+        int lru = -1;
+        for (int i = 0; i < RT_BMIR; ++i) if (g_rtBM[i].live && (lru < 0 || g_rtBM[i].lastFrame < g_rtBM[lru].lastFrame) && !rtBMPending(&g_rtBM[i])) lru = i;
+        if (lru < 0) return -1;
+        rtBMRelease(g_rtBM[lru]);
+        if (slot >= 0) { g_rtBMBytes -= g_rtBM[slot].cap; VirtualFree(g_rtBM[slot].mem, 0, MEM_RELEASE); g_rtBM[slot].mem = NULL; g_rtBM[slot].cap = 0; }
+        g_rtNBMEvict++;
+        rtBMIndexRebuild();
+    }
+    return -1;
+}
+static volatile LONG g_rtNBMNoWait = 0;
+// [Engine] BufMirrorRead = 1 keeps the v26 behaviour: a plain lock (one that reads the buffer back) is served
+// from the CPU mirror without draining the queue. v27 ships with 0: such locks drain the queue and run on the
+// game thread as they did before mirrors existed, and no mirror can ever hand the game stale bytes. Plain locks
+// are rare (~2-6 a frame; DISCARD / NOOVERWRITE staging, which never reads the mirror, is untouched), so the
+// wait this costs is small, while it removes the whole "mirror shows bytes the buffer no longer has" class by
+// construction while the stretched-tree report is chased. Staged unlocks still keep mirrors write-capture-only
+// when a mirror exists (rtBMFind never creates one while this is 0).
+static LONG g_rtBMPlainRead = 0;
+static volatile LONG g_rtNBMPlainSkip = 0;
+static RtBufMir* rtBMAdopt(void* self, void** O, bool isIB, DWORD len) {
+    if (!len || len > (8u << 20)) return NULL;
+    int slot = rtBMFreeSlot(len);
+    if (slot < 0) return NULL;
+    RtBufMir& m = g_rtBM[slot];
+    if (m.cap < len) {
+        if (m.mem) { VirtualFree(m.mem, 0, MEM_RELEASE); g_rtBMBytes -= m.cap; }
+        m.mem = (BYTE*)VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); m.cap = m.mem ? len : 0; g_rtBMBytes += m.cap;
+    }
+    if (!m.mem) return NULL;
+    rtExecLock();
+    if (rtRefPending((DWORD)(ULONG_PTR)self)) {          // a staged write of it is still queued: what the lock must show is not there yet
+        DWORD upTo = g_rtPendSeq;                        // ... until that write has run - not until the queue is empty
+        LeaveCriticalSection(&g_rtExecCs);
+        rtSyncNote(isIB ? 361 : 341, 0); g_rtCurOp = isIB ? 361 : 341;
+        rtDrainTo(upTo); g_rtNDrainTo++;
+        EnterCriticalSection(&g_rtExecCs);
+        if (rtRefPending((DWORD)(ULONG_PTR)self)) { LeaveCriticalSection(&g_rtExecCs); rtDrain(); EnterCriticalSection(&g_rtExecCs); }
+    } else g_rtNBMNoWait++;
+    g_rtDirectScope++;
+    bool ok = false; void* p = NULL;
+    ((DWORD(__stdcall*)(void*))O[1])(self);                                                        // AddRef: kept while mirrored
+    if ((LONG)((RtS5)O[11])(self, 0, 0, (DWORD)(ULONG_PTR)&p, 0x10) >= 0) {                        // READONLY, whole buffer
+        if (p) { memcpy(m.mem, p, len); ok = true; }
+        ((RtS1)O[12])(self);
+    }
+    if (!ok) ((DWORD(__stdcall*)(void*))O[2])(self);
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); g_rtNSync++;
+    if (!ok) { g_rtNBMFail++; return NULL; }
+    m.buf = (DWORD)(ULONG_PTR)self; m.len = len; m.lastFrame = g_mkFrames; m.isIB = isIB ? 1 : 0; m.live = 1; m.dead = 0;
+    { DWORD h = rtBMHash(m.buf); bool put = false;
+      for (int k = 0; k < 16; ++k) { short& e = g_rtBMIx[(h + k) & (RT_BMIX - 1)]; if (!e) { e = (short)(slot + 1); put = true; break; } }
+      if (!put) rtBMIndexRebuild(); }
+    g_rtBMAny = 1; g_rtNBMAdopt++;
+    return &m;
+}
+// A buffer that nothing has written or named, written whole for the first time through the queue (its frame is
+// drawn twice, so the write has to be a record): its mirror starts as those bytes - no read of the device, and no
+// wait when the engine locks it to read a moment later (terrain patches are filled, then touched up; log of
+// 2026-10-07: three such second locks cost 157 ms of one five-second window, each waiting for a whole queue).
+static volatile LONG g_rtNBMBlank = 0, g_rtNBMKept = 0;
+static RtBufMir* rtBMAdoptBlank(void* self, void** O, bool isIB, DWORD len) {
+    if (!len || len > (8u << 20)) return NULL;
+    int slot = rtBMFreeSlot(len);
+    if (slot < 0) return NULL;
+    RtBufMir& m = g_rtBM[slot];
+    if (m.cap < len) {
+        if (m.mem) { VirtualFree(m.mem, 0, MEM_RELEASE); g_rtBMBytes -= m.cap; }
+        m.mem = (BYTE*)VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); m.cap = m.mem ? len : 0; g_rtBMBytes += m.cap;
+    }
+    if (!m.mem) return NULL;
+    rtExecLock(); g_rtDirectScope++;
+    ((DWORD(__stdcall*)(void*))O[1])(self);                                                        // AddRef: kept while mirrored
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+    m.buf = (DWORD)(ULONG_PTR)self; m.len = len; m.isIB = isIB ? 1 : 0; m.live = 1; m.dead = 0;
+    m.lastFrame = (DWORD)g_mkFrames - 900;               // not read yet: the first to go when room is needed, and gone in half the usual time if it never is
+    { DWORD h = rtBMHash(m.buf); bool put = false;
+      for (int k = 0; k < 16; ++k) { short& e = g_rtBMIx[(h + k) & (RT_BMIX - 1)]; if (!e) { e = (short)(slot + 1); put = true; break; } }
+      if (!put) rtBMIndexRebuild(); }
+    g_rtBMAny = 1; g_rtNBMBlank++;
+    return &m;
+}
+// v34 (ISH-8 #5) fresh buffer copies: declared here, before rtBLReport reads them
+static volatile LONG g_rtSnapOn = 1;
+static volatile LONG g_rtNSnap = 0, g_rtNSnapWait = 0, g_rtNSnapCheck = 0, g_rtNSnapBad = 0, g_rtNSnapFail = 0;
+static volatile LONG64 g_rtSnapWaitTicks = 0, g_rtSnapCopyTicks = 0, g_rtSnapBytes = 0;
+// v34 (ISH-8 #5): the buffer locks that still wait for the whole queue, by the game.dat place that asked, the flags
+// and whether the lock covers the whole buffer - one line every 5 s (rtProdReport) while any waited 1 ms or more.
+#define RT_BLN 16
+struct RtBLEnt { DWORD ra, flags; BYTE whole, isIB; WORD n; LONG64 ticks; DWORD len, bytes; };
+static RtBLEnt g_rtBL[RT_BLN]; static LONG g_rtBLN = 0;
+static void rtBLNote(DWORD ra, DWORD flags, DWORD off, DWORD size, int op, LONG64 dt, void* self, void** O) {
+    if (__readfsdword(0x24) != g_rtMainTid) return;
+    DWORD len = 0; BYTE desc[32];
+    if ((LONG)((DWORD(__stdcall*)(void*, BYTE*))O[13])(self, desc) >= 0) len = *(DWORD*)(desc + 16);
+    BYTE whole = (off == 0 && (size == 0 || size == len)) ? 1 : 0;
+    LONG i = 0;
+    for (; i < g_rtBLN; ++i) if (g_rtBL[i].ra == ra && g_rtBL[i].flags == flags && g_rtBL[i].whole == whole) break;
+    if (i == g_rtBLN) { if (g_rtBLN >= RT_BLN) return; g_rtBLN++; g_rtBL[i].ra = ra; g_rtBL[i].flags = flags; g_rtBL[i].whole = whole; g_rtBL[i].isIB = op != 341; g_rtBL[i].n = 0; g_rtBL[i].ticks = 0; g_rtBL[i].bytes = 0; }
+    g_rtBL[i].n++; g_rtBL[i].ticks += dt; g_rtBL[i].len = len; g_rtBL[i].bytes += size ? size : (len > off ? len - off : 0);
+}
+static void rtBLReport() {                                  // rtProdReport's thread; the table is the game thread's, read loosely
+    { static LONG lN = 0, lW = 0; static LONG64 lWT = 0, lCT = 0, lB = 0;
+      LONG nn = g_rtNSnap, nw = g_rtNSnapWait; LONG64 wt = g_rtSnapWaitTicks, ct = g_rtSnapCopyTicks, by = g_rtSnapBytes, f = g_pqpf.QuadPart ? g_pqpf.QuadPart : 1;
+      if (nn != lN)
+          logf("buffers: last 5 s - %d plain locks served from a fresh copy of the buffer (%d KB copied) without waiting for the whole queue: %d of them waited for the buffer's own queued records, %d.%02d ms in all; copying %d.%02d ms | self-checks %d, different %d, failed copies %d%s",
+               (int)(nn - lN), (int)((by - lB) >> 10), (int)(nw - lW), (int)((wt - lWT) * 1000 / f), (int)(((wt - lWT) * 100000 / f) % 100), (int)((ct - lCT) * 1000 / f), (int)(((ct - lCT) * 100000 / f) % 100),
+               (int)g_rtNSnapCheck, (int)g_rtNSnapBad, (int)g_rtNSnapFail, g_rtSnapOn ? "" : " - OFF after a difference");
+      lN = nn; lW = nw; lWT = wt; lCT = ct; lB = by; }
+    LONG n = g_rtBLN; if (!n) return;
+    LONG64 f = g_pqpf.QuadPart ? g_pqpf.QuadPart : 1, all = 0;
+    for (LONG i = 0; i < n; ++i) all += g_rtBL[i].ticks;
+    if (all * 1000 >= f) {
+        char ln[900]; int q = 0;
+        for (LONG k = 0; k < n && k < 6 && q < 780; ++k) {
+            LONG b = -1; for (LONG i = 0; i < n; ++i) if (g_rtBL[i].n && (b < 0 || g_rtBL[i].ticks > g_rtBL[b].ticks)) b = i;
+            if (b < 0) break;
+            RtBLEnt& e = g_rtBL[b];
+            char nm[64]; symName(e.ra, nm);
+            q += wsprintfA(ln + q, " | %s %s flags %X %s (buffer %u bytes, %u written a lock): %d locks, %d.%02d ms", nm, e.isIB ? "ib" : "vb", e.flags, e.whole ? "WHOLE" : "part", e.len, e.n ? e.bytes / e.n : 0,
+                           (int)e.n, (int)(e.ticks * 1000 / f), (int)((e.ticks * 100000 / f) % 100));
+            e.n = 0;
+        }
+        logf("buffers: last 5 s - locks that waited for the whole render queue %d.%02d ms in all, by place:%s", (int)(all * 1000 / f), (int)((all * 100000 / f) % 100), ln);
+    }
+    for (LONG i = 0; i < n; ++i) { g_rtBL[i].n = 0; g_rtBL[i].ticks = 0; g_rtBL[i].bytes = 0; }
+}
+// ---------------------------------------------------------------- v34 (ISH-8 #5): plain buffer locks without the whole queue
+// MEASURED (work\ish8\s1_on, the player's skirmish test3, 2026-10-23): the buffer locks that still waited for the whole
+// render queue were plain locks (no DISCARD / NOOVERWRITE / READONLY) - game.dat+138FEB, W3D's
+// VertexBufferClass::WriteLockClass (0x538F80: Lock(0, 0, &p, 0) of a whole 480 000-byte vertex buffer, about once a
+// frame), +13911B (160 bytes of a 20-128 KB buffer, up to 700 a 5 s) and +1382F8 (whole index buffers): 9-71 ms of
+// waiting in every 5 s, and in the player's test-14 log 135-168 ms per 5 s ("waited ... vb.Lock").
+// WHY THEY WAITED: the game may read what it locks, so it must see the bytes the buffer holds at this point of its own
+// call order; and what it writes must reach the buffer after every queued draw that still uses the old bytes. v27 ran
+// such a lock directly after emptying the whole queue. (A long-lived CPU copy - BufMirrorRead - was the suspect of the
+// test-8 "stretched trees" and stays off: nothing here is kept from one lock to the next.)
+// WHAT THIS DOES - a fresh copy for every lock: (1) wait only until the newest queued record that names this buffer
+// has run - every write to a buffer is such a record (a staged write, an unlock), so after it the buffer holds exactly
+// the bytes the game would see without the render thread (draws only read it); (2) copy the locked range out of the
+// buffer (a READONLY lock, under the render lock, the worker standing between records); (3) hand the game that copy;
+// (4) at the unlock, the bytes the game left there are written into the buffer by one queued record, in order, after
+// every draw queued before - the same as the existing staged DISCARD path. Nothing is guessed: what the game reads is
+// what the buffer held, what it writes arrives where it would have.
+// SELF-CHECK: the first 32 copies (then every 1024th) are compared with the buffer read again after emptying the
+// whole queue; one byte different and this is off for the session (the game gets the re-read bytes), and the log says so.
+static LONG rtBufSnap(void* self, void** O, int op, DWORD off, DWORD size, DWORD ppData, DWORD flags, DWORD ra) {
+    BYTE desc[32];
+    if ((LONG)((DWORD(__stdcall*)(void*, BYTE*))O[13])(self, desc) < 0) return -1;                 // GetDesc: immutable
+    DWORD len = *(DWORD*)(desc + 16);
+    DWORD n = size ? size : (len > off ? len - off : 0);
+    if (!n || off > len || n > len - off || n > RT_BUF_SIZE / 8) return -1;
+    DWORD at = (g_rtArenaTop + 15) & ~15u;
+    if (at + n > RT_ARENA_SIZE) return -1;
+    DWORD b = (DWORD)(ULONG_PTR)self;
+    LONG64 t0 = qpcNow();
+    rtExecLock();
+    bool pend = rtRefPending(b); DWORD upTo = g_rtPendSeq;
+    LeaveCriticalSection(&g_rtExecCs);
+    if (pend) {                                                      // (1) only until the buffer's newest queued record has run
+        rtSyncNote(op, ra); g_rtCurOp = op;
+        rtDrainTo(upTo); g_rtNDrainTo++; InterlockedIncrement(&g_rtNSnapWait);
+    }
+    LONG64 t1 = qpcNow();
+    BYTE* mem = g_rtArena + at;
+    bool ok = false;
+    rtExecLock();
+    if (!rtRefPending(b)) {                                          // (the game thread is the only one that queues: nothing new can name it)
+        g_rtDirectScope++;
+        void* p = NULL;
+        if ((LONG)((RtS5)O[11])(self, off, n, (DWORD)(ULONG_PTR)&p, 0x10) >= 0) {             // (2) READONLY, just the range locked
+            if (p) { memcpy(mem, p, n); ok = true; }
+            ((RtS1)O[12])(self);
+        }
+        g_rtDirectScope--;
+    }
+    LeaveCriticalSection(&g_rtExecCs);
+    LONG64 t2 = qpcNow();
+    if (!ok) { InterlockedIncrement(&g_rtNSnapFail); return -1; }
+    LONG k = InterlockedIncrement(&g_rtNSnap);
+    if (k <= 32 || AOTR_STEADY((k & 1023) == 0)) {                   // self-check: the whole queue emptied, the buffer read again
+        rtDrain();
+        BYTE* q = (BYTE*)VirtualAlloc(NULL, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); bool same = false, read = false;
+        if (q) {
+            rtExecLock(); g_rtDirectScope++;
+            void* p = NULL;
+            if ((LONG)((RtS5)O[11])(self, off, n, (DWORD)(ULONG_PTR)&p, 0x10) >= 0) { if (p) { memcpy(q, p, n); read = true; } ((RtS1)O[12])(self); }
+            g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+            if (read) { same = memcmp(q, mem, n) == 0; if (!same) memcpy(mem, q, n); }
+            VirtualFree(q, 0, MEM_RELEASE);
+        }
+        InterlockedIncrement(&g_rtNSnapCheck);
+        if (read && !same) {
+            InterlockedIncrement(&g_rtNSnapBad); InterlockedExchange(&g_rtSnapOn, 0);
+            char nm[64]; symName(ra, nm);
+            logf("buffers: SELF-CHECK - a buffer copy taken after waiting only for the buffer's own queued records (%s, %s, %u bytes at %u) differs from the buffer after the whole queue - fresh copies are OFF for this session (plain locks wait for the whole queue again, as in v33); this lock gets the re-read bytes.",
+                 nm, op == 341 ? "vb" : "ib", n, off);
+        }
+    }
+    g_rtArenaTop = at + n;                                           // (3) the game gets the copy
+    RtStage& st = g_rtStage[g_rtNStage++];
+    st.buf = b; st.off = off; st.size = n; st.flags = flags; st.mem = mem; st.mir = NULL;
+    *(void**)(ULONG_PTR)ppData = mem;
+    g_rtNStaged++;
+    g_rtSnapWaitTicks += t1 - t0; g_rtSnapCopyTicks += t2 - t1; g_rtSnapBytes += n;
+    return 0;                                                        // (4) rtBufUnlock queues the write, in order
+}
+static DWORD rtBufLock(void* self, void** O, int op, DWORD off, DWORD size, DWORD ppData, DWORD flags, DWORD ra) {
+    bool wasNew = false;
+    if (g_rtFBN && __readfsdword(0x24) == g_rtMainTid && rtFBHas((DWORD)(ULONG_PTR)self)) {   // nothing queued names it: nothing queued can use it. Only the game thread takes this path - a
+                                                            // foreign one would lock a buffer the game may be writing into right now (v27 guard)
+        if ((flags & 0x10) || !twStretchOpenGt()) {
+            rtExecLock(); g_rtDirectScope++;
+            DWORD r_ = ((RtS5)O[11])(self, off, size, ppData, flags);
+            g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+            g_rtNFBLock++;
+            return r_;
+        }
+        rtFBDrop((DWORD)(ULONG_PTR)self); g_rtNFBStretch++;  // this frame is drawn twice: what is written into the buffer must be in the stream
+        wasNew = true;
+    }
+    bool plain = !(flags & 0x3010);
+    int why = 7;
+    if (flags & 0x10) why = 0; else if (!ppData) why = 1; else if (g_rtNStage >= RT_STG) why = 2;
+    if (plain && !g_rtBMPlainRead) why = 6;                  // v27: a plain lock drains and runs directly (see g_rtBMPlainRead)
+    if (g_rtArena && ppData && ((flags & 0x3000) || (plain && g_rtBMPlainRead)) && !(flags & 0x10) && g_rtNStage < RT_STG) {
+        BYTE desc[32];
+        why = 3;
+        if ((LONG)((DWORD(__stdcall*)(void*, BYTE*))O[13])(self, desc) >= 0) {                  // GetDesc: immutable
+            DWORD len = *(DWORD*)(desc + 16);
+            DWORD n = size ? size : (len > off ? len - off : 0);
+            why = 4;
+            if (n && off <= len && n <= len - off && n <= RT_BUF_SIZE / 8) {
+                DWORD b = (DWORD)(ULONG_PTR)self;
+                RtBufMir* m = NULL;
+                if (plain) {
+                    if (g_rtBMAny) rtBMReap();
+                    m = rtBMFind(b);
+                    if (!m) m = rtBMAdopt(self, O, op != 341, len);
+                    if (m && m->len != len) { m->dead = 1; g_rtNBMDrop++; g_rtBMDead++; m = NULL; }
+                } else {
+                    bool whole = off == 0 && n == len;
+                    if (g_rtBMAny) {
+                        if ((flags & 0x2000) && !whole) rtBMKill(b);              // DISCARD of a part: the rest of the buffer is no longer known
+                        else { m = rtBMFind(b); if (m && m->len != len) { m->dead = 1; g_rtNBMDrop++; g_rtBMDead++; m = NULL; }
+                               if (m && (flags & 0x2000)) g_rtNBMKept++; }        // DISCARD of all of it: the mirror becomes what is written now (at the unlock)
+                    }
+                    if (!m && wasNew && whole) m = rtBMAdoptBlank(self, O, op != 341, len);
+                }
+                DWORD at = (g_rtArenaTop + 15) & ~15u;
+                why = (plain && !m) ? 6 : 5;
+                if ((!plain || m) && at + n <= RT_ARENA_SIZE) {
+                    g_rtArenaTop = at + n;
+                    RtStage& st = g_rtStage[g_rtNStage++];
+                    st.buf = b; st.off = off; st.size = n; st.flags = flags; st.mem = g_rtArena + at; st.mir = m;
+                    if (plain) { memcpy(st.mem, m->mem + off, n); m->lastFrame = g_mkFrames; g_rtNBMLock++; }    // what a plain lock shows
+                    *(void**)(ULONG_PTR)ppData = st.mem;
+                    g_rtNStaged++;
+                    return 0;
+                }
+            }
+        }
+    }
+    if (g_rtBMAny) rtBMKill((DWORD)(ULONG_PTR)self);
+    if (plain && g_rtSnapOn && ppData && g_rtArena && g_rtNStage < RT_STG && __readfsdword(0x24) == g_rtMainTid) {
+        LONG sr = rtBufSnap(self, O, op, off, size, ppData, flags, ra);     // v34 (ISH-8 #5): a fresh copy of the buffer, no wait for the whole queue
+        if (sr >= 0) return (DWORD)sr;
+    }
+    if (plain && !g_rtBMPlainRead) g_rtNBMPlainSkip++;
+    g_rtNStageFallback++; g_rtBufFallback[why]++;
+    if (!(flags & 0x10)) twOnDirectWrite(op);            // written outside the queue: this frame's buffer writes cannot be repeated
+    rtSyncNote(op, ra); g_rtCurOp = op;
+    LONG64 tw0 = qpcNow();
+    rtDrain();
+    rtBLNote(ra, flags, off, size, op, qpcNow() - tw0, self, O);   // v34 (ISH-8 #5): which buffer locks still wait for the queue
+    EnterCriticalSection(&g_rtExecCs); g_rtDirectScope++;
+    DWORD r = ((RtS5)O[11])(self, off, size, ppData, flags);
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); g_rtNSync++; g_rtSyncHist[op]++;
+    return r;
+}
+static DWORD rtBufUnlock(void* self, void** O, int op) {
+    DWORD b = (DWORD)(ULONG_PTR)self;
+    if (g_rtFBN && rtFBHas(b)) {
+        rtExecLock(); g_rtDirectScope++;
+        DWORD r_ = ((RtS1)O[12])(self);
+        g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+        return r_;
+    }
+    for (int i = g_rtNStage - 1; i >= 0; --i) {
+        if (g_rtStage[i].buf != b) continue;
+        RtStage st = g_rtStage[i];
+        for (int k = i; k < g_rtNStage - 1; ++k) g_rtStage[k] = g_rtStage[k + 1];
+        g_rtNStage--;
+        if (st.mir && st.mir->live && !st.mir->dead && st.mir->buf == b && st.off + st.size <= st.mir->len) memcpy(st.mir->mem + st.off, st.mem, st.size);
+        RtRec* r = rtAlloc(7, st.size); r->fn = O[11]; r->op = (WORD)op;
+        DWORD* A = rtArgs(r); BYTE* P = rtPayload(r); DWORD po = 0;
+        A[0] = rtObj(r, 0, b); A[1] = st.off; A[2] = st.size; A[3] = st.flags; A[4] = (DWORD)(ULONG_PTR)O[12];
+        A[5] = rtBytes(P, &po, (DWORD)(ULONG_PTR)st.mem, st.size); A[6] = 0;
+        r->kind = 3;
+        rtCommit(r, po);
+        if (g_rtNStage == 0) g_rtArenaTop = 0;
+        return 0;
+    }
+    RtRec* r = rtAlloc(1, 0); r->fn = O[12]; r->op = (WORD)op; rtArgs(r)[0] = b; rtCommit(r, 0);
+    return 0;
+}
+static DWORD __stdcall rt_vb_11(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3) {
+    if (g_mgAny && !(a3 & 0x10)) mgOnWriteLock((DWORD)(ULONG_PTR)self);
+    if (g_rtBMAny) { DWORD t_ = __readfsdword(0x24); if (t_ != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) rtBMKill((DWORD)(ULONG_PTR)self); }
+    RT_PASSTHRU(vb, 11, RtS5, self, a0, a1, a2, a3); return rtBufLock(self, g_rtO_vb, 341, a0, a1, a2, a3, (DWORD)(ULONG_PTR)_ReturnAddress()); }
+static DWORD __stdcall rt_vb_12(void* self)                                       { RT_PASSTHRU(vb, 12, RtS1, self); return rtBufUnlock(self, g_rtO_vb, 342); }
+static DWORD __stdcall rt_ib_11(void* self, DWORD a0, DWORD a1, DWORD a2, DWORD a3) {
+    if (g_mgAny && !(a3 & 0x10)) mgOnWriteLock((DWORD)(ULONG_PTR)self);
+    if (g_rtBMAny) { DWORD t_ = __readfsdword(0x24); if (t_ != g_rtMainTid || !g_rtActive || g_rtDirectScope || g_rtCoreMode) rtBMKill((DWORD)(ULONG_PTR)self); }
+    RT_PASSTHRU(ib, 11, RtS5, self, a0, a1, a2, a3); return rtBufLock(self, g_rtO_ib, 361, a0, a1, a2, a3, (DWORD)(ULONG_PTR)_ReturnAddress()); }
+static DWORD __stdcall rt_ib_12(void* self)                                       { RT_PASSTHRU(ib, 12, RtS1, self); return rtBufUnlock(self, g_rtO_ib, 362); }
+
+// ---------------------------------------------------------------- exclusive scopes for D3DX global functions
+// D3DX creation/load/filter functions touch the device and D3DX globals from inside: run them as one
+// exclusive block (queue drained, worker parked, nested device calls direct).
+static void* g_rtXO[16];
+// The queue is drained for an exclusive scope because what the D3DX function touches is not known in general. For
+// some calls it is known:
+//   - a function that CREATES its object (a texture from a file, an empty texture, a volume or cube texture) touches
+//     nothing any queued call can refer to - the object does not exist yet;
+//   - a function that fills a surface of a texture nothing has named yet, or a system-memory surface no queued call
+//     names, writes memory no queued call reads; one that only READS a managed or system-memory surface with no
+//     queued call naming it (after a new texture's own decoded levels have been brought in) reads what is final;
+//   - D3DXCheckTextureRequirements and D3DXAssembleShader touch no object at all.
+// Those run under the exec lock alone (the render thread parked between two records), without waiting for the
+// queue: RT_QUIET() before the scope. (Log of 2026-10-07: 13 D3DXLoadSurfaceFromSurface calls building a texture
+// atlas at the end of a save load waited 280 ms for the queue on top of their own 314 ms; a volume texture made
+// after the load waited 66 ms.)
+static LONG g_rtScopeQuiet = 0;                          // game thread: the next exclusive scope need not wait for the queue
+static volatile LONG g_rtNScopeNoDrain = 0;
+#define RT_QUIET() do { if (g_rtQuietOn && g_rtActive && !g_rtDirectScope && GetCurrentThreadId() == g_rtMainTid) g_rtScopeQuiet = 1; } while (0)
+static LONG g_rtQuietOn = 1;
+// is this surface out of every queued call's reach right now? (game thread; may bring a new texture's levels in)
+static bool rtxSurfQuiet(DWORD surf, bool forWrite) {
+    if (!g_rtQuietOn || !surf || !g_rtActive || g_rtDirectScope || GetCurrentThreadId() != g_rtMainTid) return false;
+    if ((*(void***)(ULONG_PTR)surf)[13] != g_rtH_surf[13]) return false;                       // not one of the surfaces whose methods we hold
+    BYTE desc[32];
+    if ((LONG)((RtS2)g_rtO_surf[12])((void*)(ULONG_PTR)surf, (DWORD)(ULONG_PTR)desc) < 0) return false;
+    DWORD pool = ((const DWORD*)desc)[3], usage = ((const DWORD*)desc)[2];
+    if (usage & 3) return false;                                                               // a render target or depth surface: queued draws write it
+    bool quiet = false;
+    rtExecLock(); g_rtDirectScope++;
+    DWORD cont = 0; void* c = NULL;
+    if ((LONG)((DWORD(__stdcall*)(void*, const GUID*, void**))g_rtO_surf[11])((void*)(ULONG_PTR)surf, &kRtIIDUnknown, &c) >= 0 && c) { cont = (DWORD)(ULONG_PTR)c; ((DWORD(__stdcall*)(void*))(*(void***)c)[2])(c); }
+    bool isNew = cont && rtFreshHas(cont);
+    bool pendS = rtRefPending(surf), pendC = cont && rtRefPending(cont);
+    if (!pendS && pendC && g_txjOn && (isNew || !forWrite)) {                                // only its own decoded levels may be on their way: bring them in (txjFlushNow says no to anything else)
+        g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+        txjFlushNow(cont);
+        rtExecLock(); g_rtDirectScope++;
+        pendC = rtRefPending(cont);
+    }
+    if (!pendS && !pendC) {
+        if (pool == 2 || pool == 3) quiet = true;                                              // system memory: only calls that name it touch it
+        else if (isNew) quiet = true;                                                          // a texture nothing has named: no queued draw can sample it
+        else if (!forWrite && pool == 1) quiet = true;                                         // reading a managed surface nothing queued will write
+    }
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+    return quiet;
+}
+static bool rtxTexQuiet(DWORD tex) {                                                           // a texture nothing has named, with nothing on its way to it (D3DXFilterTexture the old way)
+    if (!g_rtQuietOn || !tex || !g_rtActive || g_rtDirectScope || GetCurrentThreadId() != g_rtMainTid) return false;
+    if ((*(void***)(ULONG_PTR)tex)[19] != g_rtH_tex[19] || !rtFreshHas(tex)) return false;
+    rtExecLock();
+    bool pend = rtRefPending(tex);
+    LeaveCriticalSection(&g_rtExecCs);
+    if (pend && g_txjOn && txjFlushNow(tex)) { rtExecLock(); pend = rtRefPending(tex); LeaveCriticalSection(&g_rtExecCs); }
+    return !pend;
+}
+static bool rtxVolQuiet(DWORD vol) {                                                           // a box of a volume texture that was made a moment ago and never named
+    if (!g_rtQuietOn || !vol || !g_rtActive || g_rtDirectScope || GetCurrentThreadId() != g_rtMainTid) return false;
+    if ((*(void***)(ULONG_PTR)vol)[9] != g_rtH_vol[9]) return false;
+    bool quiet = false;
+    rtExecLock(); g_rtDirectScope++;
+    void* c = NULL;
+    if ((LONG)((DWORD(__stdcall*)(void*, const GUID*, void**))g_rtO_vol[7])((void*)(ULONG_PTR)vol, &kRtIIDUnknown, &c) >= 0 && c) {
+        DWORD cont = (DWORD)(ULONG_PTR)c; ((DWORD(__stdcall*)(void*))(*(void***)c)[2])(c);
+        quiet = rtFreshHas(cont) && !rtRefPending(cont) && !rtRefPending(vol);
+    }
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+    return quiet;
+}
+static void rtxNew(DWORD pp) {                                                                 // an object a D3DX function has just made: nothing queued can name it yet
+    if (!pp || !g_rtActive || g_rtDirectScope || GetCurrentThreadId() != g_rtMainTid) return;
+    __try { DWORD o = *(DWORD*)(ULONG_PTR)pp; if (o) rtFreshAdd(o); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+#define RT_SCOPE_OPEN()  DWORD tid_ = GetCurrentThreadId(); bool cnt_ = (tid_ == g_mkTid); if (cnt_) g_rtXDepth++; \
+    bool main_ = (g_rtActive && tid_ == g_rtMainTid && !g_rtDirectScope); \
+    bool foreign_ = (g_rtActive && tid_ != g_rtMainTid && tid_ != g_rtWorkerTid); \
+    bool quiet_ = false; if (main_) { quiet_ = g_rtScopeQuiet != 0; g_rtScopeQuiet = 0; } \
+    if (main_) { if (quiet_) { rtExecLock(); g_rtNScopeNoDrain++; } else { rtDrain(); EnterCriticalSection(&g_rtExecCs); } g_rtDirectScope++; g_rtNScope++; } else if (foreign_) EnterCriticalSection(&g_rtExecCs)
+#define RT_SCOPE_CLOSE() if (main_) { g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs); } else if (foreign_) LeaveCriticalSection(&g_rtExecCs);     if (cnt_) g_rtXDepth--
+static volatile LONG g_rtXCalls[16]; static volatile LONG64 g_rtXTicks[16];              // per scoped D3DX function: calls on the game thread, time incl. the drain
+#define RT_XW(I, N, ...) { LONG64 t0_ = qpcNow(); RT_SCOPE_OPEN(); DWORD r = ((DWORD(__stdcall*)(RT_XT##N))g_rtXO[I])(__VA_ARGS__); RT_SCOPE_CLOSE(); if (main_) { g_rtXCalls[I]++; g_rtXTicks[I] += qpcNow() - t0_; } return r; }
+#define RT_XT4  DWORD, DWORD, DWORD, DWORD
+#define RT_XT7  DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD
+#define RT_XT8  DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD
+#define RT_XT9  DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD
+#define RT_XT10 DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD
+#define RT_XT14 DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD
+#define RT_XT15 DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD
+#define RT_XT16 DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD
+static DWORD __stdcall rtx0(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h, DWORD i) RT_XW(0, 9, a, b, c, d, e, f, g, h, i)
+static DWORD __stdcall rtx1(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h) RT_XW(1, 8, a, b, c, d, e, f, g, h)
+#define RT_XWK(I, N, OUT, ...) { LONG64 t0_ = qpcNow(); RT_SCOPE_OPEN(); DWORD r = ((DWORD(__stdcall*)(RT_XT##N))g_rtXO[I])(__VA_ARGS__); RT_SCOPE_CLOSE(); if (main_) { g_rtXCalls[I]++; g_rtXTicks[I] += qpcNow() - t0_; if ((LONG)r >= 0) rtxNew(OUT); } return r; }
+static DWORD __stdcall rtx2(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h) {
+    if (g_txjOn) { DWORD A[8] = { a, b, c, d, e, f, g, h }, hr_ = 0; if (txjCreateTexture(A, &hr_)) return hr_; }
+    RT_QUIET();
+    RT_XWK(2, 8, h, a, b, c, d, e, f, g, h)
+}
+static DWORD __stdcall rtx3(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h, DWORD i, DWORD j, DWORD k, DWORD l, DWORD m, DWORD n, DWORD o) {
+    if (g_txjOn) { DWORD A[15] = { a, b, c, d, e, f, g, h, i, j, k, l, m, n, o }, hr_ = 0; if (txjCreateFromFile(A, &hr_)) return hr_; }
+    RT_QUIET();
+    RT_XWK(3, 15, o, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o)
+}
+static DWORD __stdcall rtx4(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h, DWORD i, DWORD j, DWORD k, DWORD l, DWORD m, DWORD n) { RT_QUIET(); RT_XWK(4, 14, n, a, b, c, d, e, f, g, h, i, j, k, l, m, n) }
+static DWORD __stdcall rtx5(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h, DWORD i) { RT_QUIET(); RT_XWK(5, 9, i, a, b, c, d, e, f, g, h, i) }
+static DWORD __stdcall rtx6(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h, DWORD i, DWORD j, DWORD k, DWORD l, DWORD m, DWORD n, DWORD o, DWORD p) { RT_QUIET(); RT_XWK(6, 16, p, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) }
+static DWORD __stdcall rtx7(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h, DWORD i) { if (rtxVolQuiet(a)) RT_QUIET(); RT_XW(7, 9, a, b, c, d, e, f, g, h, i) }
+static DWORD __stdcall rtx8(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g) {
+    if (g_txjOn) { DWORD A[7] = { a, b, c, d, e, f, g }, hr_ = 0; if (txjCheckReq(A, &hr_)) return hr_; }
+    RT_QUIET();
+    RT_XW(8, 7, a, b, c, d, e, f, g)
+}
+static DWORD __stdcall rtx9(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h, DWORD i) {
+    if (g_txjOn) { DWORD A[9] = { a, b, c, d, e, f, g, h, i }, hr_ = 0; if (txjLoadSurfaceFile(A, &hr_)) return hr_; }   // on a worker thread, into a whole level of a managed texture
+    if (rtxSurfQuiet(a, true)) RT_QUIET();
+    RT_XW(9, 9, a, b, c, d, e, f, g, h, i)
+}
+static DWORD __stdcall rtx10(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h, DWORD i, DWORD j) {
+    if (g_txjOn) { DWORD A[10] = { a, b, c, d, e, f, g, h, i, j }, hr_ = 0; if (txjLoadSurface(A, &hr_)) return hr_; }
+    if (rtxSurfQuiet(a, true)) RT_QUIET();
+    RT_XW(10, 10, a, b, c, d, e, f, g, h, i, j)
+}
+static DWORD __stdcall rtx11(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h) {      // D3DXLoadSurfaceFromSurface(dest, destPalette, destRect, src, srcPalette, srcRect, filter, colorkey)
+    if (rtxSurfQuiet(d, false) && rtxSurfQuiet(a, true)) RT_QUIET();
+    RT_XW(11, 8, a, b, c, d, e, f, g, h)
+}
+// D3DXFilterTexture(texture, palette, source level, filter) rebuilds the mip levels below the source level from it. The
+// terrain atlas code calls it after every atlas update; as an exclusive scope it made the game thread wait for the
+// whole queue right after the mirror had spared it that wait. For a texture whose level 0 is mirrored (so nothing
+// reads it back on the game thread) the call is queued instead: it runs on the worker after the queued row upload,
+// which is the order it always ran in. The filter reads level 0 and writes the levels below - the mirror stays true.
+static bool rtTMIsMirroredTex(DWORD tex);
+static DWORD __stdcall rtAsyncFilterRun(DWORD a, DWORD b, DWORD c, DWORD d) {
+    g_rtInAsyncFilter = 1;
+    DWORD r = ((DWORD(__stdcall*)(DWORD, DWORD, DWORD, DWORD))g_rtXO[12])(a, b, c, d);
+    g_rtInAsyncFilter = 0;
+    return r;
+}
+static DWORD __stdcall rtx12(DWORD a, DWORD b, DWORD c, DWORD d) {
+    if (g_txjOn) { DWORD A[4] = { a, b, c, d }, hr_ = 0; if (txjFilter(A, &hr_)) return hr_; }     // on a worker thread, when the source level can be had without waiting
+    if (g_rtTMAtlasOn && g_rtTMAny && a && !b && (c == 0 || c == 0xFFFFFFFFu) && g_rtActive && !g_rtDirectScope && GetCurrentThreadId() == g_rtMainTid && rtTMIsMirroredTex(a)) {
+        RtRec* r = rtAlloc(4, 0); r->fn = (void*)&rtAsyncFilterRun; r->op = 509;
+        DWORD* A = rtArgs(r);
+        A[0] = rtObj(r, 0, a); A[1] = b; A[2] = c; A[3] = d;
+        rtCommit(r, 0); g_rtNAsyncFilter++;
+        return 0;
+    }
+    if (!b && rtxTexQuiet(a)) RT_QUIET();
+    RT_XW(12, 4, a, b, c, d)
+}
+static DWORD __stdcall rtx13(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g) { RT_QUIET(); RT_XW(13, 7, a, b, c, d, e, f, g) }
+struct RtXDef { const char* name; void* hook; };
+static const RtXDef kRtX[14] = {
+    {"D3DXCreateEffect", (void*)&rtx0}, {"D3DXCreateEffectFromFileA", (void*)&rtx1}, {"D3DXCreateTexture", (void*)&rtx2},
+    {"D3DXCreateTextureFromFileInMemoryEx", (void*)&rtx3}, {"D3DXCreateCubeTextureFromFileInMemoryEx", (void*)&rtx4},
+    {"D3DXCreateVolumeTexture", (void*)&rtx5}, {"D3DXCreateVolumeTextureFromFileInMemoryEx", (void*)&rtx6},
+    {"D3DXLoadVolumeFromFileInMemory", (void*)&rtx7}, {"D3DXCheckTextureRequirements", (void*)&rtx8},
+    {"D3DXLoadSurfaceFromFileInMemory", (void*)&rtx9}, {"D3DXLoadSurfaceFromMemory", (void*)&rtx10},
+    {"D3DXLoadSurfaceFromSurface", (void*)&rtx11}, {"D3DXFilterTexture", (void*)&rtx12}, {"D3DXAssembleShader", (void*)&rtx13},
+};
+
+// ---------------------------------------------------------------- installation
+static bool rtIsCode(DWORD a) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!a || !VirtualQuery((void*)(ULONG_PTR)a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+    return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+static void rtOwner(DWORD a, char* out, int n) {
+    HMODULE h = NULL; char path[MAX_PATH];
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(ULONG_PTR)a, &h) && GetModuleFileNameA(h, path, MAX_PATH)) {
+        const char* b = strrchr(path, 0x5C); lstrcpynA(out, b ? b + 1 : path, n);
+    } else lstrcpynA(out, "<no module>", n);
+}
+static bool rtHookTable(void** vt, int n, void** orig, void* const* hooks, const char* what, DWORD lo, DWORD hi) {
+    if (vt[0] == hooks[0]) return true;                  // already ours
+    (void)lo; (void)hi;
+    for (int i = 0; i < n; ++i) { DWORD f = (DWORD)(ULONG_PTR)vt[i];
+        if (!rtIsCode(f)) { logf("rt: %s vtable %08X slot %d -> %08X is not executable code - not hooked.", what, (DWORD)(ULONG_PTR)vt, i, f); return false; } }
+    { char own[64]; rtOwner((DWORD)(ULONG_PTR)vt[0], own, sizeof(own)); logf("rt: %s vtable %08X implemented in %s.", what, (DWORD)(ULONG_PTR)vt, own); }
+    for (int i = 0; i < n; ++i) orig[i] = vt[i];         // originals first, then the table
+    DWORD op = 0;
+    if (!VirtualProtect(vt, n * sizeof(void*), PAGE_READWRITE, &op)) { logf("rt: VirtualProtect failed on %s vtable.", what); return false; }
+    for (int i = 0; i < n; ++i) vt[i] = hooks[i];
+    VirtualProtect(vt, n * sizeof(void*), op, &op);
+    return true;
+}
+static void rtModuleRange(const char* name, DWORD* lo, DWORD* hi) {
+    HMODULE h = GetModuleHandleA(name); *lo = *hi = 0;
+    if (!h) return;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)h + ((IMAGE_DOS_HEADER*)h)->e_lfanew);
+    *lo = (DWORD)(ULONG_PTR)h; *hi = *lo + nt->OptionalHeader.SizeOfImage;
+}
+// Keep the worker off the game thread's physical core: on an SMT CPU two busy threads on sibling logical
+// processors each run far slower than on separate cores. Soft hint (ideal processor), never a hard affinity.
+static DWORD g_rtIdealMain = 0xFFFFFFFF, g_rtIdealWorker = 0xFFFFFFFF;
+static void rtPlaceWorker(HANDLE worker) {
+#ifdef AOTR_V4_IDEAL
+    DWORD cur = GetCurrentProcessorNumber();
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+    if (!len || len > (1u << 20)) return;
+    BYTE* buf = (BYTE*)VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buf) return;
+    KAFFINITY mainCore = 0, all = 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &len)) {
+        for (DWORD off = 0; off < len; ) {
+            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf + off);
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupMask[0].Group == 0) {
+                KAFFINITY m = e->Processor.GroupMask[0].Mask; all |= m;
+                if (cur < sizeof(KAFFINITY) * 8 && (m >> cur) & 1) mainCore = m;
+            }
+            off += e->Size;
+        }
+    }
+    VirtualFree(buf, 0, MEM_RELEASE);
+    if (!mainCore) return;
+    DWORD_PTR procMask = 0, sysMask = 0; GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask);
+    KAFFINITY cand = all & ~mainCore & (KAFFINITY)procMask;
+    if (!cand) return;
+    DWORD pick = 0xFFFFFFFF;
+    for (DWORD i = 0; i < sizeof(KAFFINITY) * 8; ++i) if ((cand >> i) & 1) { pick = i; if (i > cur) break; }   // nearest core above the game thread's
+    if (pick == 0xFFFFFFFF) return;
+    SetThreadIdealProcessor(GetCurrentThread(), cur);
+    SetThreadIdealProcessor(worker, pick);
+    g_rtIdealMain = cur; g_rtIdealWorker = pick;
+#else
+    (void)worker;
+#endif
+}
+static void rtInitBody();
+static void rtInit() {                                  // any thread; hooks the ID3DXEffect vtable and D3DX imports (once)
+    EnterCriticalSection(&g_rtInitCs);
+    if (!g_rtInitDone) { g_rtInitDone = 1; rtInitBody(); }
+    LeaveCriticalSection(&g_rtInitCs);
+}
+static void rtInitBody() {
+    char env[8]; env[0] = 0;
+    if (GetEnvironmentVariableA("AOTR_RT", env, sizeof(env)) && env[0] == '0') { g_rtTried = true; logf("rt: disabled by AOTR_RT=0."); return; }
+    // [Engine] RenderThread: -1 (default) = on only where an engine hook names the drawing thread exactly,
+    // 0 = off, 1 = on everywhere (the drawing thread is adopted from its own effect calls - the only way on a
+    // build without engine hooks). With it off nothing of the render half is installed: no adoption, no vtable
+    // swap, no texjobs, no texture cache. Render-side only - it can never desync a multiplayer game.
+    { int want = 1;                                   // v32: on for every player - the ini cannot switch it off (env AOTR_RT=0 above is the diagnostic kill switch)
+      if (want == 0) {
+          g_rtTried = true;
+          logf("rt: OFF - %s. Texture threads and the texture cache need it and stay off too.",
+               want == 0 ? "[Engine] RenderThread = 0"
+                         : "this build has no engine hooks, so the drawing thread cannot be identified exactly ([Engine] RenderThread = 1 forces it)");
+          return;
+      }
+      logf("rt: v32 - the render thread is ON for every player (not an ini choice any more); the drawing thread is adopted from its own effect calls.");
+    }
+    { int k = 0; g_rtKey = k;                                  // v32: no live key - the render thread is not a player's switch, and the
+                                                               // same key thread also held Ctrl+F8..F11 (picture-changing features)
+      if (k) logf("rt: the live on/off key is VK %d ([Engine] RtKey; 0x%02X is Scroll Lock, 118 F7, 119 F8, 45 Insert, 35 End).", k, VK_SCROLL);
+      else   logf("rt: no live on/off key (v32)."); }
+    // --- v28: core mode against full mode. [Engine] Engine = core | full (or SafeMode = 1 / 0).
+    // CORE (the default this build ships): the queue handoff is stopped - no D3D call is queued and nothing on the
+    // game thread ever waits for the worker. Every call runs here, on the game thread, exactly as it did before this
+    // DLL arrived. Nothing that is independent of the worker stops: the overlay and its panel, the file read-ahead,
+    // the warm lists and fastcrt keep running. The v27 lock admission becomes moot rather than lost, because there is
+    // no queue left for a lock to wait on. The texture DISK cache and the texture workers are part of the render half
+    // in this codebase (they hand memory to and take it back from the render thread), so core mode stops them too;
+    // that is stated plainly in TEST-10-CHANGES.md rather than papered over.
+    // FULL: the queue handoff is live, as in test-9.
+    // The measurement that chose the default was the player's own test-9 session: render thread on ran at 27 fps with
+    // 166 stalls of 100 ms or more, and the worst stalls sat on the queue's own depth (6800-27800 calls a frame),
+    // while turning the tool off entirely ran better. The Insert key switches between the two live, so one session
+    // settles it on numbers (the AB lines).
+    { bool full = true;                               // v32: FULL - the queue handoff is live (the player's order: "multicore majburiy")
+      logf("rt: v32 - FULL mode: every D3D9 and D3DX effect call of the game's drawing thread is queued in order and carried out on the render worker thread, so the game's own thread goes on with its next work. On Windows' own d3d9 (not DXVK) it is not used - see the install line.");
+      InterlockedExchange(&g_rtCoreMode, full ? 0 : 1);
+      InterlockedExchange(&g_rtWantOn, full ? 1 : 0);
+    }
+    rtOpNoTouchInit();
+    g_rtDs.on = 1;
+    if (GetEnvironmentVariableA("AOTR_FXDEDUPE", env, sizeof(env)) && env[0] == (char)48) { g_rtFxDedupeOn = 0; logf("rt: effect parameter de-dupe off (AOTR_FXDEDUPE=0)."); }
+    if (!g_rtFxBlk) g_rtFxBlk = (RtFxBlk*)VirtualAlloc(NULL, RT_PBN * sizeof(RtFxBlk), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!g_rtFxV) { g_rtFxV = (RtFxVal*)VirtualAlloc(NULL, (SIZE_T)RT_FXV * sizeof(RtFxVal), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); if (!g_rtFxV) g_rtFxDedupeOn = 0; }
+    if (GetEnvironmentVariableA("AOTR_DEVDEDUPE", env, sizeof(env)) && env[0] == '0') { g_rtDs.on = 0; logf("rt: vertex-input de-dupe off (AOTR_DEVDEDUPE=0)."); }
+    if (GetEnvironmentVariableA("AOTR_CALLDEDUPE", env, sizeof(env)) && env[0] == '0') { g_rtSS.on = 0; logf("rt: call de-dupe off (AOTR_CALLDEDUPE=0)."); }
+    if (GetEnvironmentVariableA("AOTR_ATLASMIRROR", env, sizeof(env)) && env[0] == '0') { g_rtTMAtlasOn = 0; logf("rt: terrain atlas mirror off (AOTR_ATLASMIRROR=0)."); }
+    if (GetEnvironmentVariableA("AOTR_USSNAP", env, sizeof(env)) && env[0] == '0') { g_rtUSOn = 0; logf("rt: UpdateSurface snapshots off (AOTR_USSNAP=0)."); }
+    if (GetEnvironmentVariableA("AOTR_FXBATCH", env, sizeof(env)) && env[0] == '0') { g_rtFxBatchOn = 0; logf("rt: effect parameter batching off (AOTR_FXBATCH=0)."); }
+    { char e5[8]; e5[0] = 0; if (GetEnvironmentVariableA("AOTR_BUFSNAP", e5, sizeof(e5)) && e5[0] == '0') { g_rtSnapOn = 0; logf("rt: fresh buffer copies OFF (AOTR_BUFSNAP=0) - plain buffer locks wait for the whole queue (v33)."); }
+      else logf("rt: plain buffer locks (no DISCARD / NOOVERWRITE / READONLY) get a fresh copy of the buffer after its own queued records have run, and their bytes are written back in queue order - no wait for the whole queue; nothing is kept between locks (self-checked: first 32, then every 1024th)."); }
+    { int v = iniWant("BufMirrorRead", 0); g_rtBMPlainRead = v ? 1 : 0;
+      if (!g_rtBMPlainRead) logf("rt: plain buffer locks drain the queue and run on the game thread ([Engine] BufMirrorRead = 0): CPU buffer mirrors never hand the game bytes (write-only DISCARD staging unchanged).");
+      else logf("rt: plain buffer locks are served from CPU mirrors ([Engine] BufMirrorRead = 1)."); }
+    // --- v28: call de-dupe and the adaptive bypass
+    { g_rtSS.on = 0;                                  // v32: OFF for good. rt_harness (DXVK, 300 frames): with it on 146 of 300 pictures
+                                                      // differ from the game without the render thread; with it off every picture is
+                                                      // byte-identical (work/ish5/rt). A dropped state change is a broken picture.
+      rtSSInvalidate();
+      if (g_rtSS.on) logf("rt: call de-dupe ON ([Engine] CallDedupe = 1): a SetRenderState / SetSamplerState / SetTextureStageState / SetTexture / SetTransform / SetMaterial / SetViewport / SetFVF that sets what the device already holds is not queued at all (kill switch: AOTR_CALLDEDUPE=0).");
+      else logf("rt: call de-dupe OFF (v32: it changed pictures in the offline test; every call the game makes is carried out)."); }
+    { g_rtBypassOn = 1;                               // v32: one trigger only - the render thread itself froze the game
+      g_rtBypQueueDepth = 0;                          // a deep queue is not a freeze (test-9 battles queued 1300-7300 calls a frame)
+      g_rtBypWaitMs = 250;                            // ... but one wait of the game thread for the worker of 250 ms+ is (test-9: 887 ms)
+      g_rtBypStalls = 0;                              // stalls from elsewhere (map load, the game's own work) are not the render thread's
+      logf("rt: freeze guard ON: if the game's thread once waits %d ms or more for the render worker in play (%d ms while a map loads or a menu is up - no logic step for 3 s), the render thread steps aside for 10 s and is then tried again; only after %d such retries does it stay aside for the session. A deep queue or long frames that are not waits for the worker do not switch it off.",
+           (int)g_rtBypWaitMs, (int)g_rtBypWaitLoadMs, RT_BYP_RETRIES); }
+    rtModuleRange("d3dx9_27.dll", &g_dxLo, &g_dxHi);
+    if (!g_dxLo) { g_rtTried = true; logf("rt: d3dx9_27 not loaded - render thread OFF."); return; }
+    void** fvt = (void**)(ULONG_PTR)(g_dxLo + 0x13EB0);
+    __try {
+        if ((DWORD)(ULONG_PTR)fvt[63] != g_dxLo + 0x1062F5 || (DWORD)(ULONG_PTR)fvt[64] != g_dxLo + 0x108148 ||
+            (DWORD)(ULONG_PTR)fvt[65] != g_dxLo + 0x107FD6 || (DWORD)(ULONG_PTR)fvt[75] != g_dxLo + 0x10863A ||
+            (DWORD)(ULONG_PTR)fvt[78] != g_dxLo + 0x103D7B) {
+            g_rtTried = true; logf("rt: ID3DXEffect vtable does not match this d3dx9_27 build - render thread OFF."); return;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_rtTried = true; logf("rt: effect vtable probe faulted - render thread OFF."); return; }
+    g_rtWake = CreateEventA(NULL, FALSE, FALSE, NULL); g_rtDrained = CreateEventA(NULL, FALSE, FALSE, NULL);
+    g_rtPresented = CreateEventA(NULL, FALSE, FALSE, NULL); g_rtReady = CreateEventA(NULL, TRUE, FALSE, NULL);
+    g_rtBuf = (BYTE*)VirtualAlloc(NULL, RT_BUF_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    g_rtQ = (RtQ*)VirtualAlloc(NULL, RT_QC * sizeof(RtQ), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    g_rtQStr = (char*)VirtualAlloc(NULL, RT_QSTR, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    g_rtPBReal = (DWORD*)VirtualAlloc(NULL, RT_PBN * sizeof(DWORD), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    g_rtPBLive = (BYTE*)VirtualAlloc(NULL, RT_PBN, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    g_rtArena = (BYTE*)VirtualAlloc(NULL, RT_ARENA_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (g_rtBuf) memset(g_rtBuf, 0, RT_BUF_SIZE);
+    if (g_rtArena) memset(g_rtArena, 0, 8u << 20);
+    if (!g_rtBuf || !g_rtWake || !g_rtDrained || !g_rtPresented || !g_rtReady) { g_rtTried = true; logf("rt: allocation failed - render thread OFF."); return; }
+    if (!rtHookTable(fvt, 79, g_rtO_fx, g_rtH_fx, "ID3DXEffect", g_dxLo, g_dxHi)) { g_rtTried = true; return; }
+    // D3DX global functions imported by the game module that touch the device
+    HMODULE hGame = GetModuleHandleA("game.dat"); if (!hGame) hGame = GetModuleHandleA(NULL);
+    int nx = 0;
+    for (int i = 0; i < 14; ++i) {
+        FARPROC* slot = iatSlot((BYTE*)hGame, "d3dx9_27.dll", kRtX[i].name);
+        if (!slot) continue;
+        g_rtXO[i] = (void*)*slot;
+        if (hookSlot(slot, kRtX[i].hook, NULL)) ++nx;
+    }
+    if (g_rtKey) CreateThread(NULL, 0, rtKeyThread, NULL, 0, NULL);     // v32: no key thread (g_rtKey = 0)
+    logf("rt: armed - ID3DXEffect vtable hooked (79 slots), %d D3DX device functions scoped; starts at the first effect call on the render thread. VK %d toggles it live.", nx, (int)g_rtKey);
+}
+static void rtInstall(void* fx) {                       // game render thread, from inside an effect call
+    g_rtTried = true;
+    __try {
+        rtModuleRange("d3d9.dll", &g_d3d9Lo2, &g_d3d9Hi2);
+        if (!g_d3d9Lo2) { logf("rt: d3d9.dll not loaded - render thread OFF."); return; }
+        {   // v32: FULL only on DXVK. Windows' own d3d9 rewrites the device's private method-table copy on every
+            // BeginStateBlock (work/probe11/vtprobe.exe), so device calls slip past the queue while texture and buffer
+            // calls go through it: the crash of test-9 21:00:17 in the worker thread. There nothing is installed - the
+            // game draws exactly as without this DLL, and the panel counts at Present's code (hot-patch).
+            HMODULE d9 = GetModuleHandleA("d3d9.dll");
+            char path[MAX_PATH]; path[0] = 0; if (d9) GetModuleFileNameA(d9, path, MAX_PATH);
+            char sys[MAX_PATH]; sys[0] = 0; UINT ns = GetSystemWow64DirectoryA(sys, MAX_PATH); if (!ns) ns = GetSystemDirectoryA(sys, MAX_PATH);
+            char sys2[MAX_PATH]; sys2[0] = 0; UINT ns2 = GetSystemDirectoryA(sys2, MAX_PATH);
+            bool winOwn = (ns && !_strnicmp(path, sys, ns) && path[ns] == '\\') || (ns2 && !_strnicmp(path, sys2, ns2) && path[ns2] == '\\');
+            if (winOwn) {
+                logf("rt: d3d9.dll is Windows' own (%s), not DXVK - the render thread is NOT used in this session: Windows' d3d9 rewrites the device's method table under it (the test-9 crash). Every call runs on the game thread. With the AotR launcher's DXVK it runs.", path);
+                return;
+            }
+            logf("rt: d3d9.dll is DXVK (%s) - the render thread goes live.", path);
+        }
+        void* dev = NULL;
+        ((DWORD(__stdcall*)(void*, void**))g_rtO_fx[68])(fx, &dev);            // ID3DXEffect::GetDevice
+        if (!dev) { logf("rt: effect has no device - render thread OFF."); return; }
+        void** dvt = *(void***)dev;
+        ((DWORD(__stdcall*)(void*))dvt[2])(dev);                                 // drop GetDevice's reference
+        for (int i = 0; i < 119; ++i) { DWORD f = (DWORD)(ULONG_PTR)dvt[i];
+            if (!rtIsCode(f)) { logf("rt: device vtable slot %d -> %08X is not executable code - render thread OFF.", i, f); return; } }
+        { char o0[64], o17[64], o82[64]; rtOwner((DWORD)(ULONG_PTR)dvt[0], o0, 64); rtOwner((DWORD)(ULONG_PTR)dvt[17], o17, 64); rtOwner((DWORD)(ULONG_PTR)dvt[82], o82, 64);
+          logf("rt: device vtable %p: QueryInterface in %s, Present in %s, DrawIndexedPrimitive in %s.", dvt, o0, o17, o82); }
+        for (int i = 0; i < 119; ++i) g_rtO_dev[i] = dvt[i];
+        // one throwaway object of every class to reach its vtable (created with the original methods)
+        typedef DWORD (__stdcall* C8)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+        typedef DWORD (__stdcall* C7)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+        typedef DWORD (__stdcall* C9)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+        typedef DWORD (__stdcall* C6)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+        typedef DWORD (__stdcall* C2)(void*, DWORD, DWORD);
+        void* tex = 0, *surf = 0, *cube = 0, *vtex = 0, *vol = 0, *vb = 0, *ib = 0, *sb = 0, *q = 0, *sc = 0;
+        ((C8)g_rtO_dev[23])(dev, 1, 1, 1, 0, 21, 1, (DWORD)(ULONG_PTR)&tex, 0);          // CreateTexture A8R8G8B8 MANAGED
+        if (tex) ((C2)(*(void***)tex)[18])(tex, 0, (DWORD)(ULONG_PTR)&surf);            // GetSurfaceLevel
+        ((C7)g_rtO_dev[25])(dev, 1, 1, 0, 21, 1, (DWORD)(ULONG_PTR)&cube, 0);            // CreateCubeTexture
+        ((C9)g_rtO_dev[24])(dev, 1, 1, 1, 1, 0, 21, 1, (DWORD)(ULONG_PTR)&vtex, 0);      // CreateVolumeTexture
+        if (vtex) ((C2)(*(void***)vtex)[18])(vtex, 0, (DWORD)(ULONG_PTR)&vol);          // GetVolumeLevel
+        ((C6)g_rtO_dev[26])(dev, 16, 0, 0, 1, (DWORD)(ULONG_PTR)&vb, 0);                 // CreateVertexBuffer
+        ((C6)g_rtO_dev[27])(dev, 16, 0, 101, 1, (DWORD)(ULONG_PTR)&ib, 0);               // CreateIndexBuffer INDEX16
+        ((C2)g_rtO_dev[59])(dev, 1, (DWORD)(ULONG_PTR)&sb);                              // CreateStateBlock ALL
+        ((C2)g_rtO_dev[118])(dev, 8, (DWORD)(ULONG_PTR)&q);                              // CreateQuery EVENT
+        if (!q) ((C2)g_rtO_dev[118])(dev, 9, (DWORD)(ULONG_PTR)&q);                     // or OCCLUSION
+        ((C2)g_rtO_dev[14])(dev, 0, (DWORD)(ULONG_PTR)&sc);                              // GetSwapChain
+        void* vsh = 0, *psh = 0, *decl = 0;
+        { struct VE { WORD s, o; BYTE t, m, u, ui; } el[2] = { {0, 0, 2, 0, 0, 0}, {0xFF, 0, 17, 0, 0, 0} };
+          ((C2)g_rtO_dev[86])(dev, (DWORD)(ULONG_PTR)&el, (DWORD)(ULONG_PTR)&decl); }                // CreateVertexDeclaration
+        { typedef HRESULT (WINAPI* AsmF)(const char*, UINT, void*, void*, DWORD, void**, void**);
+          HMODULE hx9 = GetModuleHandleA("d3dx9_27.dll"); AsmF asmf = hx9 ? (AsmF)GetProcAddress(hx9, "D3DXAssembleShader") : NULL;
+          static const char kVs[] = "vs.1.1\ndcl_position v0\nmov oPos, v0\n";
+          static const char kPs[] = "ps.1.1\ndef c0, 1, 1, 1, 1\nmov r0, c0\n";
+          void* b = NULL;
+          if (asmf && asmf(kVs, sizeof(kVs) - 1, NULL, NULL, 0, &b, NULL) >= 0 && b) {
+              ((C2)g_rtO_dev[91])(dev, (DWORD)(ULONG_PTR)((void*(WINAPI*)(void*))(*(void***)b)[3])(b), (DWORD)(ULONG_PTR)&vsh);   // CreateVertexShader
+              ((DWORD(__stdcall*)(void*))(*(void***)b)[2])(b); b = NULL; }
+          if (asmf && asmf(kPs, sizeof(kPs) - 1, NULL, NULL, 0, &b, NULL) >= 0 && b) {
+              ((C2)g_rtO_dev[106])(dev, (DWORD)(ULONG_PTR)((void*(WINAPI*)(void*))(*(void***)b)[3])(b), (DWORD)(ULONG_PTR)&psh);  // CreatePixelShader
+              ((DWORD(__stdcall*)(void*))(*(void***)b)[2])(b); } }
+        if (!tex || !surf || !vb || !ib || !sb || !sc) {
+            logf("rt: could not create probe objects (tex=%p surf=%p vb=%p ib=%p sb=%p sc=%p) - render thread OFF.", tex, surf, vb, ib, sb, sc);
+            return;
+        }
+        g_rtX87 = _control87(0, 0); g_rtMxcsr = _mm_getcsr();                      // capture on the game thread
+        HANDLE th = CreateThread(NULL, 0, rtWorker, NULL, 0, NULL);
+        if (!th) { logf("rt: worker thread creation failed - render thread OFF."); return; }
+        SetThreadPriority(th, THREAD_PRIORITY_ABOVE_NORMAL);
+        rtPlaceWorker(th);
+        if (WaitForSingleObject(g_rtReady, 5000) != WAIT_OBJECT_0) logf("rt: the worker thread had not started after 5 s - going on; it takes the queue up when it runs.");
+        CloseHandle(th);
+        DWORD lo = g_d3d9Lo2, hi = g_d3d9Hi2;
+        bool ok = true;
+        ok = ok && rtHookTable(*(void***)tex,  22, g_rtO_tex,  g_rtH_tex,  "Texture",       lo, hi);
+        ok = ok && rtHookTable(*(void***)surf, 17, g_rtO_surf, g_rtH_surf, "Surface",       lo, hi);
+        ok = ok && rtHookTable(*(void***)vb,   14, g_rtO_vb,   g_rtH_vb,   "VertexBuffer",  lo, hi);
+        ok = ok && rtHookTable(*(void***)ib,   14, g_rtO_ib,   g_rtH_ib,   "IndexBuffer",   lo, hi);
+        ok = ok && rtHookTable(*(void***)sb,    6, g_rtO_sb,   g_rtH_sb,   "StateBlock",    lo, hi);
+        ok = ok && rtHookTable(*(void***)sc,   10, g_rtO_sc,   g_rtH_sc,   "SwapChain",     lo, hi);
+        if (ok && cube) ok = rtHookTable(*(void***)cube, 22, g_rtO_cube, g_rtH_cube, "CubeTexture",   lo, hi);
+        if (ok && vtex) ok = rtHookTable(*(void***)vtex, 22, g_rtO_vtex, g_rtH_vtex, "VolumeTexture", lo, hi);
+        if (ok && vol)  ok = rtHookTable(*(void***)vol,  11, g_rtO_vol,  g_rtH_vol,  "Volume",        lo, hi);
+        if (ok && q)    ok = rtHookTable(*(void***)q,     8, g_rtO_q,    g_rtH_q,    "Query",         lo, hi);
+        bool refsHooked = false;
+        if (ok && vsh && psh && decl) {
+            refsHooked = rtHookTable(*(void***)vsh, 5, g_rtO_vs, g_rtH_vs, "VertexShader", lo, hi)
+                      && rtHookTable(*(void***)psh, 5, g_rtO_ps, g_rtH_ps, "PixelShader", lo, hi)
+                      && rtHookTable(*(void***)decl, 5, g_rtO_decl, g_rtH_decl, "VertexDeclaration", lo, hi);
+        }
+        g_rtObjRefs = !refsHooked;                        // every bindable class now releases through the queue
+        if (ok) ok = rtHookTable(dvt, 119, g_rtO_dev, g_rtH_dev, "Device", lo, hi);
+        if (ok) spWrap();                                // smooth shadows: where a pixel shader is bound
+        if (ok) { twInitOnce(); twWrap(); }              // in-between frames: the calls that name the back buffer, and Present
+        if (ok) txjOnInstall(dev);                       // texture decoding off the game thread: what the device answers D3DX
+        // release the probes (hooks are still in pass-through: the render thread is not active yet)
+        void* probes[13] = { decl, psh, vsh, q, sc, sb, ib, vb, vol, vtex, cube, surf, tex };
+        for (int i = 0; i < 13; ++i) if (probes[i]) ((DWORD(__stdcall*)(void*))(*(void***)probes[i])[2])(probes[i]);
+        if (!ok) { logf("rt: a vtable could not be hooked - render thread stays OFF (hooks pass through)."); return; }
+        g_rtMainTid = GetCurrentThreadId();
+        InterlockedExchange(&g_rtInstalled, 1);
+        InterlockedExchange(&g_rtActive, g_rtWantOn ? 1 : 0);
+        if (g_rtCoreMode)
+            logf("rt: CORE mode live - device %p, game thread %u. Every D3D9 and D3DX call runs directly on the game thread, exactly as before this DLL arrived; no queue, no worker handoff, nothing waits for the renderer. The overlay, the file read-ahead, the warm lists and fastcrt stay on. Press VK %d to switch to FULL (queue) live.", dev, g_rtMainTid, (int)g_rtKey);
+        else
+            logf("rt: FULL mode live (RENDER THREAD) - device %p, game thread %u, worker thread %u. All D3D9 and D3DX effect work now runs on the worker (per-call object refs %s).", dev, g_rtMainTid, g_rtWorkerTid, g_rtObjRefs ? "ON (shader/declaration classes not hooked)" : "off");
+        logf("multicore: render thread %s - the game's drawing calls are carried out on worker thread %u, in the order the game made them.", g_rtCoreMode ? "installed (CORE)" : "LIVE", g_rtWorkerTid);
+        CreateThread(NULL, 0, rtProdReport, NULL, 0, NULL);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        logf("rt: install faulted (0x%08lX) - render thread OFF (hooks pass through).", (unsigned long)GetExceptionCode());
+    }
+}
+
+// ---------------------------------------------------------------- v32: the product build's render thread line (every 5 s)
+// rtReport (the diagnostic one, ten lines every five seconds) is not started in the product build. This one line says
+// whether the render thread is carrying the drawing calls, how many, how long the worker was busy with them (time the
+// game thread did NOT spend in Direct3D) and the longest single wait of the game thread for the worker.
+static DWORD WINAPI rtProdReport(LPVOID) {
+    LONG lA = 0, lS = 0, lP = 0; LONG64 lB = 0, lD = 0, lPE = 0, lPW = 0;
+    for (;;) {
+        Sleep(5000);
+        LONG a = g_rtNAsync, sy = g_rtNSync, pr = g_rtNPresent;
+        LONG64 b = rd64(&g_rtBusyTicks), d = rd64(&g_rtDrainTicks);
+        LONG wmax = InterlockedExchange(&g_rtProdWaitMax, 0);
+        LONG dP = pr - lP; LONG64 f = g_pqpf.QuadPart ? g_pqpf.QuadPart : 1;
+        if (dP > 0 || g_rtActive)
+            logf("rt: last 5 s - %s | %d pictures, %d calls queued (%d a picture), %d waits for the worker | the worker carried out %d.%d ms of Direct3D work a picture on its own core; the game thread waited for it %d.%d ms a picture, longest single wait %d ms",
+                 g_rtActive ? "FULL: drawing calls carried out on the render worker" : (g_rtBypassFired ? "stepped aside (freeze guard) - every call on the game thread" : "not live - every call on the game thread"),
+                 (int)dP, (int)(a - lA), dP > 0 ? (int)((a - lA) / dP) : 0, (int)(sy - lS),
+                 dP > 0 ? (int)((b - lB) * 1000 / f / dP) : 0, dP > 0 ? (int)(((b - lB) * 10000 / f / dP) % 10) : 0,
+                 dP > 0 ? (int)((d - lD) * 1000 / f / dP) : 0, dP > 0 ? (int)(((d - lD) * 10000 / f / dP) % 10) : 0, (int)wmax);
+        if (dP > 0 && g_rtActive) {
+            LONG64 pe = rd64(&g_rtPresentExecTicks), pw = rd64(&g_rtPresentWaitTicks);
+            logf("rt: last 5 s - Present on the worker took %d.%d ms a picture (the wait for the GPU / swap chain, part of the worker's work above); the game thread waited %d.%d ms a picture for the previous picture's Present",
+                 (int)((pe - lPE) * 1000 / f / dP), (int)(((pe - lPE) * 10000 / f / dP) % 10), (int)((pw - lPW) * 1000 / f / dP), (int)(((pw - lPW) * 10000 / f / dP) % 10));
+            lPE = pe; lPW = pw;
+        }
+        lA = a; lS = sy; lP = pr; lB = b; lD = d;
+        rtBLReport();                                     // v34: which buffer locks waited for the queue
+    }
+}
+
+// ---------------------------------------------------------------- live A/B switch
+static DWORD WINAPI rtKeyThread(LPVOID) {
+    bool down = false;
+    for (;;) {
+        Sleep(50);
+        int k = g_rtKey;
+        bool now = k ? (GetAsyncKeyState(k) & 0x8000) != 0 : false;
+        if (now && !down && g_rtInstalled) {
+            // v28: the live A/B key now switches between the two architectures, not just the queue on/off. FULL =
+            // the queue handoff is live (render thread); CORE = every call runs on the game thread while the texture
+            // cache, the texture workers, the warm lists, the v27 lock admission, the read-ahead and the overlay all
+            // keep running. One 20-minute session therefore measures both, and the AB lines say which was smoother.
+            if (g_rtCoreMode) {                          // v83.1: the wish only - rtApplyToggle flips both flags after draining the queue
+                InterlockedExchange(&g_rtWantOn, 1);
+                logf("rt: key VK %d pressed - switching to FULL mode (queue handoff live; applies at the next frame).", k);
+            } else {
+                InterlockedExchange(&g_rtWantOn, 0);
+                logf("rt: key VK %d pressed - switching back to CORE mode (no queue, every call direct; applies at the next frame).", k);
+            }
+        }
+        down = now;
+        { static bool pdown = false;
+          bool p = (GetAsyncKeyState(VK_PAUSE) & 0x8000) != 0;
+          if (p && !pdown && g_lsInstalled) {
+              LONG v = InterlockedExchange(&g_lsWant, g_lsWant ? 0 : 1);
+              InterlockedIncrement(&g_lsToggles);
+              logf("logicspread: Pause pressed - %s requested (applies at the next logic step).", v ? "engine schedule" : "spreading");
+          }
+          pdown = p; }
+        { static bool mdown = false;                                 // Ctrl+F11: shared draw calls on / off, for an A/B look
+          bool m = (GetAsyncKeyState(VK_F11) & 0x8000) && (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+          if (m && !mdown) mgToggle();
+          mdown = m; }
+        { static bool tdown = false;                                 // Ctrl+F10: in-between frames on / off
+          bool t = (GetAsyncKeyState(VK_F10) & 0x8000) && (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+          if (t && !tdown) twToggle();
+          tdown = t; }
+        { static bool bdown = false;                                 // Ctrl+F9: pictures on a steady beat / shown as they are finished
+          bool b = (GetAsyncKeyState(VK_F9) & 0x8000) && (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+          if (b && !bdown) twBeatToggle();
+          bdown = b; }
+        { static bool wdown = false;                                 // Ctrl+F8: pan pictures shown from where the camera is / as they were drawn
+          bool wk = (GetAsyncKeyState(VK_F8) & 0x8000) && (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+          if (wk && !wdown) pwToggle();
+          wdown = wk; }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- reporting (every 5 s)
+// ---------------------------------------------------------------- the adaptive bypass and the A/B record (v28)
+// The player asked for one thing above all: never slower than the game without the tool. The measurement that
+// decided this build says the render thread was the part that could be slower, and that it was slower exactly when
+// the queue burst. So the render thread now watches its own queue and takes itself out of the way when the queue
+// bursts - the same path the Insert key has switched to since v27, so there is nothing new to trust - and it reports
+// the before and after in the same five-second line, so the next run can be judged on numbers rather than on a
+// feeling. Once it has stepped aside it stays aside for the session: a switch that flickers every few seconds would
+// be its own kind of stutter.
+//
+// The A/B record is built on the key that was already there ([Engine] RtKey, Insert by default). Every time the
+// render thread is switched on or off, and every minute, one compact line says what each side of the switch
+// measured: frames a second, stalls of 100 ms or more, the worst frame, the queue depth, and the CPU load.
+struct RtAbSeg {
+    LONG on;                        // 1 = the render thread was live in this segment
+    DWORD ticks;                    // how long the segment ran, ms
+    LONG frames;                    // frames in it
+    LONG stalls, stalls250, stalls500;
+    LONG stallMs;                   // total time in frames of 100 ms or more, ms
+    LONG worstMs;                   // the longest single frame in it, ms
+    LONG cpuMax, cpuSum, cpuN;      // process CPU load, percent
+    LONG64 queuedCalls;             // calls handed to the queue in it
+    LONG queuePeak;                 // the deepest the queue got, calls behind the worker
+    LONG waitMaxMs;                 // the worst single wait for the queue
+    DWORD waitOp;                   // what that wait was waiting on
+};
+static RtAbSeg g_ab[2];             // [0] = render thread off, [1] = on
+static LONG g_abSeg = 0;            // which of the two is being filled now
+static LONG g_abSegs = 0;           // segments closed so far in this session
+static DWORD g_abStart = 0;
+static LONG g_abPrevFrames = 0;
+static LONG64 g_abPrevCalls = 0;
+static LONG64 g_abPrevStall = 0, g_abPrevGap = 0;
+static LONG g_abPeak = 0;
+static LONG g_abSessStalls = 0, g_abSessFrames = 0;    // the whole session, for the closing line
+// what the LAST five-second window measured, for the bypass decision (see rtBypassCheck)
+static LONG g_abWinStalls = 0, g_abWinWaitMs = 0, g_abWinQueueF = 0;
+static void rtAbLog(const RtAbSeg* s, const char* why);
+static void rtAbReseg(int on, const char* why);
+
+static void rtAbNote(DWORD now) {                        // called from the report thread every five seconds
+    if (!g_abStart) {                                    // the first note seeds the segment with the mode that is really live
+        g_abStart = now; g_abPrevFrames = g_mkFrames; g_abPrevCalls = g_rtNAsync;
+        g_abSegs = 1;
+        g_ab[0].on = (g_rtActive != 0) ? 1 : 0;
+        g_abSegWorst = 0; g_abPrevStall = g_abStallTicks;
+        logf("AB: --- segment 1 starts: render thread %s (first note; %s mode) ---",
+             g_ab[0].on ? "ON" : "OFF", g_ab[0].on ? "FULL" : "CORE");
+        return;
+    }
+    RtAbSeg* s = &g_ab[g_abSeg & 1];
+    if ((g_rtActive != 0) != (s->on != 0)) { rtAbReseg(g_rtActive != 0, "switch"); return; }
+    LONG f = g_mkFrames - g_abPrevFrames;                 // frames since the last note
+    LONG64 c = g_rtNAsync - g_abPrevCalls;
+    s->frames += f; s->queuedCalls += c;
+    g_abSessFrames += f;
+    LONG behind = (LONG)((g_rtSeq - g_rtExecSeq) & 0x7FFFFFFFu);
+    if (behind > s->queuePeak) s->queuePeak = behind;
+    if (behind > g_abPeak) g_abPeak = behind;
+    g_abWinQueueF = f > 0 ? (LONG)(c / f) : 0;
+    { static LONG lFh[9]; LONG fh[9]; for (int k = 0; k < 9; ++k) { LONG v = g_frHist[k]; fh[k] = v - lFh[k]; lFh[k] = v; }
+      LONG st = fh[6] + fh[7] + fh[8];
+      s->stalls += st; s->stalls250 += fh[7] + fh[8]; s->stalls500 += fh[8];
+      g_abSessStalls += st; g_abWinStalls = st; }
+    { LONG64 st = g_abStallTicks; s->stallMs += (LONG)((st - g_abPrevStall) * 1000 / (g_pqpf.QuadPart ? g_pqpf.QuadPart : 1)); g_abPrevStall = st; }
+    { LONG64 w = g_abSegWorst;                        // reset at every segment switch, so it is this segment's own
+      LONG ms = (LONG)(w * 1000 / (g_pqpf.QuadPart ? g_pqpf.QuadPart : 1));
+      if (ms > s->worstMs) s->worstMs = ms; }
+    { LONG m = InterlockedExchange(&g_rtWaitMaxMs, 0); LONG op = g_rtWaitMaxOp; g_rtWaitMaxOp = 0xFFFF;
+      g_abWinWaitMs = m;
+      if (m > s->waitMaxMs) { s->waitMaxMs = m; s->waitOp = (DWORD)op; } }
+    g_abPrevFrames = g_mkFrames; g_abPrevCalls = g_rtNAsync;
+}
+static void rtAbReseg(int on, const char* why) {         // the switch moved: close the segment that ran, start the new one
+    DWORD now = GetTickCount();
+    RtAbSeg* s = &g_ab[g_abSeg & 1];
+    if (g_abStart) { s->ticks = now - g_abStart; rtAbLog(s, why); }
+    // Only the slot being handed back is cleared. The segment that just closed STAYS in its own slot, so the
+    // overlay's report (aotr_report.txt) can show BOTH stretches of one session side by side - g_abSeg always
+    // points at the one being filled, and g_abSeg ^ 1 is the last closed one.
+    g_abSeg = (g_abSeg + 1) & 1;
+    memset(&g_ab[g_abSeg], 0, sizeof(g_ab[g_abSeg]));
+    if (g_abSegs == 0) g_abSegs = 1; else ++g_abSegs;    // the first note already made it 1; a switch makes it 2, 3, ...
+    g_ab[g_abSeg].on = on ? 1 : 0;
+    g_abStart = now; g_abPrevFrames = g_mkFrames; g_abPrevCalls = g_rtNAsync;
+    g_abSegWorst = 0;                                    // the new segment measures its own worst frame
+    g_abPrevStall = g_abStallTicks;                      // and its own stall time
+    logf("AB: --- segment %d starts: render thread %s (%s) ---", (int)g_abSegs, on ? "ON" : "OFF", why);
+}
+// v29: the line takes the elapsed time as an argument. The segment that just CLOSED carries its own frozen
+// s->ticks (set by rtAbReseg). The segment still RUNNING has no s->ticks yet - that was the defect: the one-minute
+// line called this with a live segment, read 0, and printed "0.0 fps over 0 frames in 600 s". The caller now passes
+// the real elapsed ms (GetTickCount() - g_abStart), so the minute line reports the minute that actually ran.
+static void rtAbLogT(const RtAbSeg* s, const char* why, DWORD elapsedMs) {
+    LONG fps10 = 0;
+    DWORD secs = elapsedMs / 1000;
+    if (secs) fps10 = (LONG)((LONG64)s->frames * 10 / secs);
+    LONG64 qpf10 = s->frames > 0 ? (s->queuedCalls * 10 / s->frames) : 0;
+    logf("AB: %s | %s mode, segment %d of %d, %d.%d fps over %d frames in %u s | frames 100ms+ %d (250+ %d, 500+ %d), stall time %d ms, longest frame %d ms | queue %d.%d calls/frame, deepest %d behind the worker, worst single wait %d ms on %s | cpu %d%% max, %d%% avg",
+         why, s->on ? "FULL" : "CORE", (int)g_abSegs, (int)g_abSegs,
+         (int)(fps10 / 10), (int)(fps10 % 10), (int)s->frames, (unsigned)secs,
+         (int)s->stalls, (int)s->stalls250, (int)s->stalls500, (int)s->stallMs, (int)s->worstMs,
+         (int)(qpf10 / 10), (int)(qpf10 % 10), (int)s->queuePeak, (int)s->waitMaxMs,
+         s->waitOp == 0xFFFF ? "-" : rtOpName((int)s->waitOp),
+         (int)s->cpuMax, s->cpuN ? (int)(s->cpuSum / s->cpuN) : 0);
+}
+static void rtAbLog(const RtAbSeg* s, const char* why) { rtAbLogT(s, why, s->ticks); }
+static void rtAbTick(DWORD now, int cpuPct) {             // once per report window: keep the running maxima
+    RtAbSeg* s = &g_ab[g_abSeg & 1];
+    s->ticks = now - g_abStart;
+    if (cpuPct > s->cpuMax) s->cpuMax = cpuPct;
+    if (cpuPct) { s->cpuSum += cpuPct; s->cpuN++; }
+}
+// ---- the adaptive bypass itself
+static void rtBypassEngage(const char* why, const char* how) {
+    if (InterlockedExchange(&g_rtBypassFired, 1)) return;
+    InterlockedExchange(&g_rtBypassWhy, why[0] == 'q' ? 1 : why[0] == 'w' ? 2 : 3);
+    LONG n = InterlockedIncrement(&g_rtBypassN);
+    bool last = n > RT_BYP_RETRIES;
+    g_rtBypassRetryAt = last ? 0 : (GetTickCount() + 10000) | 1;
+    // v33: only the wish is set here; the switch itself is made at the next Present on the game thread (rtApplyToggle):
+    // the queue is drained FIRST, then calls go direct. Setting g_rtCoreMode here at once (v32) let the game thread's
+    // next calls - a Release among them - run directly while older records naming the same objects were still queued:
+    // texjob_test caught an upload record writing into a texture that was already freed.
+    InterlockedExchange(&g_rtWantOn, 0);                  // applied at the next Present
+    if (last)
+        logf("rt: FREEZE GUARD - %s (%s). Freeze %d - the %d retries are used up: the render thread steps aside for the rest of this session: every call runs directly on the game thread again (as without this DLL), the worker drains what is already queued and then sleeps. Everything else keeps running.",
+             why, how, (int)n, RT_BYP_RETRIES);
+    else
+        logf("rt: FREEZE GUARD - %s (%s). Freeze %d of at most %d tolerated: the render thread steps aside for 10 s (every call directly on the game thread; the worker drains what is queued), then it is tried again.",
+             why, how, (int)n, RT_BYP_RETRIES + 1);
+}
+// v34: on the game thread at each Present: the 10 s are over - the render thread is asked for again (applied at once by
+// rtApplyToggle in the same Present, which turns the queue on only when it is off)
+static void rtBypassRetryTick() {
+    DWORD at = g_rtBypassRetryAt;
+    if (!at || !g_rtBypassFired || (LONG)(GetTickCount() - at) < 0) return;
+    g_rtBypassRetryAt = 0;
+    logf("rt: freeze guard - 10 s are over: the render thread is tried again (retry %d of %d).", (int)g_rtBypassN, RT_BYP_RETRIES);
+    InterlockedExchange(&g_rtBypassFired, 0);
+    InterlockedExchange(&g_rtWantOn, 1);
+}
+// The decision, once per five-second window, on what that window measured. All three tests come straight from the
+// test-9 field evidence: the two worst freezes of that run happened at queue depths of 6,807 and 25,883 calls a
+// frame, a single wait for the queue reached 887 ms, and the 4v4 windows with a burst held most of the 166 stalls.
+static void rtBypassCheck(const char* span) {
+    // v34 (ISH-8 #3): never from a report window - only a real wait of the game thread for the worker (rtDrainTo) can
+    // make the render thread step aside. (This window check counted the same waits a second time, without the time the
+    // worker spent waiting for texture workers and without the loading limit.)
+    (void)span; return;
+    if (!g_rtBypassOn || !g_rtInstalled || !g_rtActive || g_rtBypassFired) return;
+    char why[160];
+    if (g_rtBypQueueDepth > 0 && g_abWinQueueF > g_rtBypQueueDepth) {
+        wsprintfA(why, "the queue burst past %d calls a frame", (int)g_rtBypQueueDepth);
+        rtBypassEngage(why, span);
+    } else if (g_rtBypWaitMs > 0 && g_abWinWaitMs > g_rtBypWaitMs) {
+        wsprintfA(why, "one wait for the queue reached %d ms (over %d ms)", (int)g_abWinWaitMs, (int)g_rtBypWaitMs);
+        rtBypassEngage(why, span);
+    } else if (g_rtBypStalls > 0 && g_abWinStalls > g_rtBypStalls) {
+        wsprintfA(why, "%d frames of 100 ms or more in one five-second window (over %d)", (int)g_abWinStalls, (int)g_rtBypStalls);
+        rtBypassEngage(why, span);
+    }
+}
+
+static DWORD WINAPI rtReport(LPVOID) {
+    LONG lastFrames = 0; LONG64 lastPeriod = 0;
+    LONG lAsync = 0, lSync = 0, lRel = 0, lForeign = 0, lPresent = 0, lScope = 0;
+    LONG64 lDrain = 0, lBusy = 0, lBytes = 0, lPWait = 0;
+    static LONG lHist[512];
+    ULONG64 lastCpu = 0;
+    for (;;) {
+        Sleep(5000);
+        ULONG64 pc = 0; { FILETIME c, e, k, u; if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) pc = (((ULONG64)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((ULONG64)u.dwHighDateTime << 32) | u.dwLowDateTime); }
+        int cpu = lastCpu ? (int)((pc - lastCpu) / 10000 / 50) : 0; lastCpu = pc;
+        LONG fr = g_mkFrames; LONG dF = fr - lastFrames; lastFrames = fr;
+        LONG64 per = rd64(&g_mkPeriod); LONG64 dP = per - lastPeriod; lastPeriod = per;
+        static LONG64 lSt[3];
+        LONG64 sh = 0, vw = 0, ui = 0;
+        for (int p = 0; p < 3; ++p) { LONG64 I = rd64(&g_stTicks[p]); LONG64 d = I - lSt[p]; lSt[p] = I;
+            if (p == 0) sh = d; else if (p == 1) vw = d; else ui = d; }
+        LONG a = g_rtNAsync, s = g_rtNSync, rl = g_rtNRelease, fo = g_rtNForeign, pr = g_rtNPresent, sc = g_rtNScope;
+        LONG64 dr = rd64(&g_rtDrainTicks), bu = rd64(&g_rtBusyTicks), by = rd64(&g_rtBytes), pw = rd64(&g_rtPresentWaitTicks);
+        LONG f = dF > 0 ? dF : 1;
+        char m1[16], m2[16], m3[16], m4[16], m5[16], m6[16], m7[16], m8[16], q1[16], q2[16], q3[16], q4[16], mb[16];
+        char top[400]; int tp = 0; top[0] = 0;
+        LONG d[512]; for (int i = 0; i < 512; ++i) { LONG v = g_rtSyncHist[i]; d[i] = v - lHist[i]; lHist[i] = v; }
+        static LONG64 lOpT[512]; LONG64 dOpT[512]; for (int i = 0; i < 512; ++i) { LONG64 v = rd64(&g_rtDrainOpTicks[i]); dOpT[i] = v - lOpT[i]; lOpT[i] = v; }
+        for (int k = 0; k < 8; ++k) { int bi = -1; LONG bc = 0; for (int i = 0; i < 512; ++i) if (d[i] > bc) { bc = d[i]; bi = i; }
+            if (bi < 0 || tp > 330) break; char per1[16], dm[16]; tp += wsprintfA(top + tp, " %s x%s (%sms)", rtOpName(bi), perStr(bc, f, per1), msStr(dOpT[bi], f, dm)); d[bi] = 0; }
+        static LONG lQH = 0, lQM = 0, lStg = 0, lSf = 0, lLk = 0, lDL = 0, lMir = 0; LONG qh = g_rtQHit, qm = g_rtQMiss, st = g_rtNStaged, sf = g_rtNStageFallback;
+        LONG lk = g_rtNLocked, dl = g_rtNDirectLock, mir = g_rtNMirror;
+        static LONG lPix = 0, lPbp = 0; LONG pix = g_rtNPixel, pbp = g_rtNPBProxy; char c7[16], c8[16];
+        char c1[16], c2[16], c3[16], c4[16], c5[16], c6[16];
+        logf("rt: %s%s%s cpu=%d%% frames=%d ms/f=%s | shadow %s views %s ui %s ms/f | queued/f %s sync/f %s release/f %s scope/f %s foreign=%d | drain %s present-wait %s worker-busy %s ms/f | %s MB/f | query-cache hit/f %s miss/f %s | staged locks/f %s | direct locks/f %s locked calls/f %s mirror/f %s pixel writes/f %s param blocks/f %s | sync top:%s",
+             g_rtActive ? "LIVE" : "off", g_rtActive ? "" : (g_rtCoreMode ? " (CORE)" : ""), g_rtToggles ? "*" : "", cpu, dF, msStr(dP, f, m1), msStr(sh, f, m2), msStr(vw, f, m3), msStr(ui, f, m4),
+             perStr(a - lAsync, f, q1), perStr(s - lSync, f, q2), perStr(rl - lRel, f, q3), perStr(sc - lScope, f, q4), fo - lForeign,
+             msStr(dr - lDrain, f, m5), msStr(pw - lPWait, f, m6), msStr(bu - lBusy, f, m7), perStr((by - lBytes) / 104857, f * 10, mb), perStr(qh - lQH, f, c1), perStr(qm - lQM, f, c2), perStr(st - lStg, f, c3),
+             perStr(dl - lDL, f, c4), perStr(lk - lLk, f, c5), perStr(mir - lMir, f, c6), perStr(pix - lPix, f, c7), perStr(pbp - lPbp, f, c8), top);
+        lPix = pix; lPbp = pbp;
+        // --- v28: call de-dupe, and the single worst wait of the window with the object it was waiting on. This runs
+        //     BEFORE rtAbNote, which consumes and clears the same worst-wait counters for the AB line.
+        { static LONG lSkip = 0, lKeep = 0;
+          static LONG lSR = 0, lSS = 0, lST = 0, lTX = 0, lTF = 0, lMT = 0, lVP = 0, lFVF = 0;
+          LONG sk = g_rtNCallSkip, kp = g_rtNCallKept;
+          LONG sr = g_rtSS.nSkipRS, ss = g_rtSS.nSkipSS, stn = g_rtSS.nSkipTSS, tx = g_rtSS.nSkipTex;
+          LONG tf = g_rtSS.nSkipTF, mt = g_rtSS.nSkipMtl, vp = g_rtSS.nSkipVP, fv = g_rtSS.nSkipFVF;
+          LONG dsk = sk - lSkip, dkp = kp - lKeep;
+          if (dsk || dkp || g_rtSS.on) {
+              char s1[16], s2[16];
+              logf("rt: call de-dupe %s (%s) | this window: dropped/f %s kept/f %s (%d%% of the eight state setters dropped) | by setter, dropped this window: RenderState %d Sampler %d TextureStageState %d Texture %d Transform %d Material %d Viewport %d FVF %d | shadow invalidated %d times (off-queue %d, reset %d, state block %d, other %d)",
+                   g_rtSS.on ? "ON" : "off", g_rtCoreMode ? "CORE: decided here, on the game thread" : "FULL: decided at the queue", perStr(dsk, f, s1), perStr(dkp, f, s2),
+                   (dsk + dkp) ? (int)((LONG64)dsk * 100 / (dsk + dkp)) : 0,
+                   (int)(sr - lSR), (int)(ss - lSS), (int)(stn - lST), (int)(tx - lTX), (int)(tf - lTF), (int)(mt - lMT), (int)(vp - lVP), (int)(fv - lFVF),
+                   (int)g_rtSS.nInvalid, (int)g_rtSS.nInvalidWhy[0], (int)g_rtSS.nInvalidWhy[1], (int)g_rtSS.nInvalidWhy[2], (int)g_rtSS.nInvalidWhy[3]);
+              lSkip = sk; lKeep = kp; lSR = sr; lSS = ss; lST = stn; lTX = tx; lTF = tf; lMT = mt; lVP = vp; lFVF = fv;
+          }
+        }
+        { LONG wm = (LONG)g_rtWaitMaxMs; DWORD wo = g_rtWaitMaxOp; DWORD wb = g_rtWaitMaxBehind;
+          if (wm > 0) logf("rt: worst single wait for the renderer this window: %d ms on %s, with %d records still behind it (%d wait calls, %d timeouts)",
+                           (int)wm, wo == 0xFFFF ? "-" : rtOpName((int)wo), (int)wb, (int)g_rtNWaitCalls, (int)g_rtWaitTimeouts);
+          InterlockedExchange(&g_rtWaitMaxMs, 0); g_rtWaitMaxOp = 0xFFFF; g_rtWaitMaxBehind = 0; g_rtNWaitCalls = 0; g_rtWaitTimeouts = 0; }
+        // --- v28: the A/B record and the adaptive bypass. Both read what this window measured, so the AB line and
+        //     the bypass decision are the same numbers - no second measuring instrument to disagree with. The AB line
+        //     itself is written once a minute (and at every switch, from rtAbReseg) so a long session stays readable.
+        { DWORD now = GetTickCount();
+          rtAbTick(now, cpu);
+          rtAbNote(now);
+          static DWORD lAbLog2 = 0;
+          if (now - lAbLog2 >= 60000) { lAbLog2 = now; rtAbLogT(&g_ab[g_abSeg & 1], "one-minute", g_abStart ? (now - g_abStart) : 60000); }
+          rtBypassCheck("five-second window");
+        }
+        if (dF > 0) {                                          // where the frame goes: logic by sub-frame, client outside the stages, animation
+            static LONG64 lPhT[PH_N]; LONG64 dPh[PH_N];
+            for (int p = 0; p < PH_N; ++p) { LONG64 v = rd64(&g_phTicks[p]); dPh[p] = v - lPhT[p]; lPhT[p] = v; }
+            char lg[420]; int lp = 0; lg[0] = 0;
+            static LONG lLgN[8]; static LONG64 lLgT[8];
+            for (int k = 0; k < 8; ++k) {
+                LONG cn = g_lgN[k] - lLgN[k]; LONG64 ct = rd64(&g_lgT[k]) - lLgT[k]; lLgN[k] += cn; lLgT[k] += ct;
+                LONG64 mx = g_lgMax[k]; g_lgMax[k] = 0;
+                if (cn <= 0) continue;
+                char a1[16], a2[16]; lp += wsprintfA(lg + lp, " n%d x%d avg %s max %s", k, (int)cn, msStr(ct, cn, a1), msStr(mx, 1, a2));
+            }
+            char fb[300]; int fp2 = 0; fb[0] = 0;
+            static LONG lFrN[8]; static LONG64 lFrT[8];
+            for (int k = 0; k < 8; ++k) {
+                LONG cn = g_frByN[k] - lFrN[k]; LONG64 ct = rd64(&g_frTByN[k]) - lFrT[k]; lFrN[k] += cn; lFrT[k] += ct;
+                if (cn <= 0) continue;
+                char a1[16]; fp2 += wsprintfA(fb + fp2, " n%d %s", k, msStr(ct, cn, a1));
+            }
+            static LONG lFh[9]; LONG fh[9]; for (int k = 0; k < 9; ++k) { LONG v = g_frHist[k]; fh[k] = v - lFh[k]; lFh[k] = v; }
+            LONG64 fmx = g_frMax; g_frMax = 0;
+            char an[400]; int ap = 0; an[0] = 0;
+            static const char* const kAnName[AN_N] = { "progress", "hlod-update", "tree-update" };
+            static LONG lAnN[AN_N][PH_N]; static LONG64 lAnT[AN_N][PH_N];
+            for (int a = 0; a < AN_N; ++a) {
+                ap += wsprintfA(an + ap, " %s", kAnName[a]);
+                for (int p = 0; p < PH_N; ++p) {
+                    LONG cn = g_anN[a][p] - lAnN[a][p]; LONG64 ct = rd64(&g_anT[a][p]) - lAnT[a][p]; lAnN[a][p] += cn; lAnT[a][p] += ct;
+                    if (cn <= 0) continue;
+                    LONG64 q = g_tscPerQpc > 0 ? (LONG64)((double)ct / g_tscPerQpc) : 0;
+                    char a1[16], a2[16]; ap += wsprintfA(an + ap, " %s:%s/f,%sms/f", kPhaseName[p], perStr(cn, f, a1), msStr(q, f, a2));
+                }
+            }
+            char g1[16], g2[16], g3[16], g4[16];
+            logf("rt: phases ms/f logic %s client-outside-stages %s outside-both %s | logic by sub-frame:%s",
+                 msStr(dPh[PH_LOGIC], f, g1), msStr(dPh[PH_CLIENT] - sh - vw - ui, f, g2), msStr(dP - dPh[PH_LOGIC] - dPh[PH_CLIENT], f, g3), lg);
+            logf("rt: frames <20:%d <25:%d <33:%d <40:%d <50:%d <67:%d <100:%d <200:%d >=200:%d max %s ms | frame ms by sub-frame:%s",
+                 (int)fh[0], (int)fh[1], (int)fh[2], (int)fh[3], (int)fh[4], (int)fh[5], (int)fh[6], (int)fh[7], (int)fh[8], msStr(fmx, 1, g4), fb);
+            if (g_diag) logf("rt: anim%s", an);
+            static LONG lEH = 0, lEM = 0, lEF = 0, lPW = 0, lPS = 0, lPSt = 0, lPC = 0, lPP = 0, lFH = 0, lFM = 0, lFC = 0; static LONG64 lPT = 0, lPST = 0;
+            LONG eh = g_eqHit, em = g_eqMiss, ef = g_eqFast, pw = g_pwWarmed, ps = g_pwSkips, pst = g_pwStale, pc = g_pwChecked, pp = g_pwPasses; LONG64 pt = rd64(&g_pwTicks), pscan = rd64(&g_pwScanTicks);
+            LONG fhit = g_fltHit, fm = g_fltMiss, fc = g_fltCalls;
+            char e1[16], e2[16], e3[16], w1[16], w2[16], w3[16], w4[16], w5[16], w6[16], w7[16], x1[16], x2[16], x3[16];
+            logf("rt: opt buf-mirror adopted %d locks %d dropped %d failed %d evicted %d MB %d fallback ro %d noptr %d full %d desc %d range %d arena %d nomirror %d | plain locks drained by the v27 guard %d | annotation reads kept %d | fresh-texture locks %d (sync %d, tracked %d) | tex-mirror adopted %d locks %d dropped %d failed %d | fastcrt=%d | equiv-memo hit/f %s miss/f %s same-final/f %s clears %d | filter-memo calls/f %s hit/f %s miss/f %s clears %d | pose-warm2 %s workers=%d passes/f %s warmed/f %s skipped/f %s stale/f %s checked/f %s mismatches %d faults %d warm %s ms/f (scan %s)",
+                 (int)g_rtNBMAdopt, (int)g_rtNBMLock, (int)g_rtNBMDrop, (int)g_rtNBMFail, (int)g_rtNBMEvict, (int)(g_rtBMBytes >> 20),
+                 (int)g_rtBufFallback[0], (int)g_rtBufFallback[1], (int)g_rtBufFallback[2], (int)g_rtBufFallback[3], (int)g_rtBufFallback[4], (int)g_rtBufFallback[5], (int)g_rtBufFallback[6], (int)g_rtNBMPlainSkip, (int)g_rtNAnnHit, (int)g_rtNFreshLock, (int)g_rtNFreshMiss, (int)g_rtNFreshAdd, (int)g_rtNTMAdopt, (int)g_rtNTMLock, (int)g_rtNTMDrop, (int)g_rtNTMFail, (int)g_crtInstalled, perStr(eh - lEH, f, e1), perStr(em - lEM, f, e2), perStr(ef - lEF, f, e3), (int)g_eqClears,
+                 perStr(fc - lFC, f, x1), perStr(fhit - lFH, f, x2), perStr(fm - lFM, f, x3), (int)g_fltClears,
+                 g_pwKill ? "OFF" : (g_pwCheckLeft > 0 ? "checking" : "live"), g_pwNW, perStr(pp - lPP, f, w6), perStr(pw - lPW, f, w1), perStr(ps - lPS, f, w2), perStr(pst - lPSt, f, w3), perStr(pc - lPC, f, w4),
+                 (int)g_pwMismatch, (int)g_pwFaults, msStr(pt - lPT, f, w5), msStr(pscan - lPST, f, w7));
+            lEH = eh; lEM = em; lEF = ef; lPW = pw; lPS = ps; lPSt = pst; lPC = pc; lPP = pp; lPT = pt; lPST = pscan; lFH = fhit; lFM = fm; lFC = fc;
+            { static LONG lOpN[512]; LONG dn[512]; char ln[900]; int q = 0;
+              for (int i = 0; i < 512; ++i) { LONG v = g_rtOpN[i]; dn[i] = v - lOpN[i]; lOpN[i] = v; }
+              q += wsprintfA(ln + q, "rt: queued ops per frame:");
+              bool used[512]; memset(used, 0, sizeof(used));
+              for (int k = 0; k < 12; ++k) {
+                  int bi = -1; LONG bc = 0;
+                  for (int i = 0; i < 512; ++i) if (!used[i] && dn[i] > bc) { bc = dn[i]; bi = i; }
+                  if (bi < 0) break; used[bi] = true;
+                  char p1[16]; q += wsprintfA(ln + q, " %s %s |", rtOpName(bi), perStr(bc, f, p1));
+                  if (q > 800) break;
+              }
+              logf("%s", ln); }
+            rlReport(f);
+            if (g_diag) { ftReport(f); ctReport(f); }
+            pickReport(f);
+            if (g_diag) ssReport(f);
+            dgReport(f);
+            lsReport(f);
+            mxReport(f);
+            alReport(f);
+            { static LONG lFJ = 0, lFS = 0, lFSt = 0, lFC = 0, lFR = 0;
+              LONG fj = g_pwFullJobs, fs = g_pwFullSkips, fst = g_pwFullStale, fc = g_pwFullChecked;
+              char q1[16], q2[16], q3[16], q4[16];
+              static LONG lBW = 0; LONG bw = g_pwBoundsWarmed; char q5[16];
+              logf("rt: pose-warm3 %s | whole-HLod jobs/f %s skipped/f %s stale/f %s checked/f %s mismatches %d | sub-object bounds warmed/f %s",
+                   g_pwFullOn ? "on" : "OFF", perStr(fj - lFJ, f, q1), perStr(fs - lFS, f, q2), perStr(fst - lFSt, f, q3), perStr(fc - lFC, f, q4), (int)g_pwFullMismatch, perStr(bw - lBW, f, q5));
+              lFJ = fj; lFS = fs; lFSt = fst; lFC = fc; lBW = bw; (void)lFR; }
+            { static LONG lCand[8]; char ln[400];
+              char c0[16], c1[16], c2[16], c3[16], c4[16], c5[16], c6[16];
+              LONG d[7]; for (int i = 0; i < 7; ++i) { LONG v = g_pwCand[i]; d[i] = v - lCand[i]; lCand[i] = v; }
+              char w1[16]; LONG wn = g_pwWaitRep; LONG64 wt = rd64(&g_pwWaitRepT);
+              static LONG lWn = 0; static LONG64 lWt = 0; LONG dwn = wn - lWn; LONG64 dwt = wt - lWt; lWn = wn; lWt = wt;
+              msStr(dwt, f, w1);
+              wsprintfA(ln, "rt: pose-warm scan per frame: nodes %s | rejected: not-HLod %s no-tree %s anim-mode %s already-clean %s not-drawn-last-frame %s | taken %s | worker wait %s ms/f over %d passes%s",
+                        perStr(d[0], f, c0), perStr(d[1], f, c1), perStr(d[2], f, c2), perStr(d[3], f, c3), perStr(d[4], f, c4), perStr(d[5], f, c5), perStr(d[6], f, c6),
+                        w1, (int)dwn, g_pwStop ? " (WARMING OFF: the wait cost more than it saved)" : "");
+              logf("%s", ln); }
+            { static LONG lWhy[8]; LONG d[8]; for (int i = 0; i < 8; ++i) { LONG v = g_pwWhy[i]; d[i] = v - lWhy[i]; lWhy[i] = v; }
+              if (d[7] > 0) {
+                  char ln[700]; int q = 0;
+                  q += wsprintfA(ln + q, "rt: pose-warm refusals (1 in 8 sampled, %d): in-container %d no-tree %d lod-table %d null/bone %d sub-object-class %d sub-object-owner %d extra-list %d | classes:",
+                                 (int)d[7], (int)d[0], (int)d[1], (int)d[2], (int)d[3], (int)d[4], (int)d[5], (int)d[6]);
+                  for (int i = 0; i < 12 && g_pwBadVt[i] && q < 620; ++i) q += wsprintfA(ln + q, " vt game.dat+%06X (slot#%d) x%d", g_pwBadVt[i] - 0x400000, (int)g_pwBadSlot[i], (int)g_pwBadVtN[i]);
+                  logf("%s", ln);
+              } }
+            { static LONG lS = 0, lO = 0, lM = 0; LONG sb = g_rtPH.cpuSib, ot = g_rtPH.cpuOther, mg = g_rtPH.cpuMigr; LONG ds = sb - lS, dOt = ot - lO; char m1[16];
+              LONG tot = ds + dOt;
+              logf("rt: cpu placement: worker on the game thread's SMT sibling in %d%% of %d samples; game thread cpu changes/f %s (now cpu %u, worker cpu %u)",
+                   tot > 0 ? (int)(ds * 100 / tot) : 0, (int)tot, perStr(mg - lM, f, m1), (unsigned)g_rtPH.lastCpu, (unsigned)g_rtWH.cpu);
+              lS = sb; lO = ot; lM = mg; }
+            { static LONG lFs = 0, lFk = 0; LONG fs = g_rtNFxSkip, fk = g_rtNFxKept; char q1[16], q2[16];
+              logf("rt: effect parameters already set/f %s, written/f %s%s | table drops: %d (off-queue call %d, block %d, reset %d, other %d; off-queue from: other thread %d (of which the render worker itself %d), rt off %d, direct scope %d), by parameter block %d", perStr(fs - lFs, f, q1), perStr(fk - lFk, f, q2), g_rtFxDedupeOn ? "" : " (de-dupe OFF)", (int)g_rtNFxInval, (int)g_rtNFxInvalWhy[0], (int)g_rtNFxInvalWhy[1], (int)g_rtNFxInvalWhy[2], (int)g_rtNFxInvalWhy[3], (int)g_rtNFxOffWho[0], (int)g_rtNFxOffWho[3], (int)g_rtNFxOffWho[1], (int)g_rtNFxOffWho[2], (int)g_rtNFxBlkInval); lFs = fs; lFk = fk; }
+            { static LONG lXs = 0, lXh = 0, lSd = 0, lAf = 0; LONG xs = g_rtNXSaved, xh = g_rtNXHit, sd = g_rtNSyncDL, af = g_rtNAsyncFilter; char e1[16], e2[16], e3[16], e4[16];
+              static LONG lH2 = 0; LONG h2 = g_rtNH2Saved; char e5[16];
+              logf("rt: lock checks answered exactly/f %s, waits avoided/f %s (exact entries %d, added %d, replaced %d) | first-time objects cleared by the second hash/f %s | drained system-memory locks unlocked directly/f %s | mip filters queued/f %s",
+                   perStr(xh - lXh, f, e1), perStr(xs - lXs, f, e2), (int)g_rtXN, (int)g_rtNXAdd, (int)g_rtNXEvict, perStr(h2 - lH2, f, e5), perStr(sd - lSd, f, e3), perStr(af - lAf, f, e4)); lXs = xs; lXh = xh; lSd = sd; lAf = af; lH2 = h2;
+              { static LONG lP = 0, lPd = 0, lPt = 0; LONG p = g_rtNPlainSL, pd = g_rtNPlainDirect, pt = g_rtNPlainTo; char p1[16], p2[16], p3[16];
+                logf("rt: managed non-render-target locks/f %s (v27), lock-without-any-wait/f %s, waited only for their own records/f %s | drained system-memory-style locks this way so far %d",
+                     perStr(p - lP, f, p1), perStr(pd - lPd, f, p2), perStr(pt - lPt, f, p3), (int)(g_rtNPlainDirect + g_rtNPlainTo)); lP = p; lPd = pd; lPt = pt; }
+              int liveM = 0; for (int i = 0; i < RT_TMIR; ++i) if (g_rtTM[i].live && !g_rtTM[i].dead) ++liveM;
+              logf("rt: tex mirrors live %d of %d | adopted %d dropped %d failed %d | no free slot %d | refused without waiting %d | first locks left alone %d, idle mirrors replaced %d", liveM, RT_TMIR, (int)g_rtNTMAdopt, (int)g_rtNTMDrop, (int)g_rtNTMFail, (int)g_rtNTMNoSlot, (int)g_rtNTMNoHit, (int)g_rtNTMFirst, (int)g_rtNTMEvict); }
+            { static LONG lXc[16]; static LONG64 lXt[16]; char ln[700]; int q = 0; ln[0] = 0;
+              for (int k = 0; k < 14; ++k) { LONG cN = g_rtXCalls[k], dN = cN - lXc[k]; LONG64 tN = rd64(&g_rtXTicks[k]), dT = tN - lXt[k]; lXc[k] = cN; lXt[k] = tN; if (dN <= 0) continue;
+                  char x1[16], x2[16]; q += wsprintfA(ln + q, " %s %s/f %s ms/f |", kRtX[k].name, perStr(dN, f, x1), msStr(dT, f, x2)); if (q > 600) break; }
+              if (q) logf("rt: exclusive D3DX scopes (each waits for the queue):%s", ln); }
+            { static LONG lSk = 0, lSt = 0; LONG sk = g_rtDs.nSkip, st = g_rtDs.nSet; char d1[16], d2[16];
+              logf("rt: vertex-input calls already in place/f %s, queued/f %s%s", perStr(sk - lSk, f, d1), perStr(st - lSt, f, d2), g_rtDs.on ? "" : " (de-dupe OFF)"); lSk = sk; lSt = st; }
+            { static LONG lSn = 0, lGe = 0; LONG sn = g_rtNUSSnap, ge = g_rtNUSGeneric; char u1[16], u2[16];
+              logf("rt: UpdateSurface snapshots/f %s, as before/f %s (private staging surfaces %d)%s | atlas mirror %s", perStr(sn - lSn, f, u1), perStr(ge - lGe, f, u2), (int)g_rtNUSStage,
+                   g_rtUSOn ? "" : " (snapshots OFF)", g_rtTMAtlasOn ? "on" : "OFF"); lSn = sn; lGe = ge; }
+            { static LONG lB = 0, lE = 0; LONG b = g_rtNFxBatch, e = g_rtNFxEntry; char b1[16], b2[16];
+              logf("rt: effect parameter batches/f %s, writes/f %s%s", perStr(b - lB, f, b1), perStr(e - lE, f, b2), g_rtFxBatchOn ? "" : " (batching OFF)"); lB = b; lE = e; }
+        }
+        lQH = qh; lQM = qm; lStg = st; lSf = sf; lLk = lk; lDL = dl; lMir = mir;
+        static bool gsStarted = false;
+        if (!gsStarted && g_gsStart && g_rtActive && dF >= 20 && dP >= (LONG64)dF * g_pqpf.QuadPart * 30 / 1000) {
+            gsStarted = true; HANDLE hg = CreateThread(NULL, 0, g_gsStart, NULL, 0, NULL); if (hg) CloseHandle(hg);
+        }
+        static int rep6 = 0; static LONG dumpFrames = 0;
+        dumpFrames += dF;
+        if (++rep6 >= 6) {                                     // every 30 s: where the remaining synchronous calls come from
+            rep6 = 0;
+            LONG fr30 = dumpFrames; dumpFrames = 0;
+            if (fr30 >= 60) {
+                mtReport(fr30);
+                profRefreshModules();
+                static bool usedS[RT_SCN]; memset(usedS, 0, sizeof(usedS));
+                for (int k = 0; k < 12; ++k) {
+                    int bi = -1; LONG bc = 0;
+                    for (int i = 0; i < RT_SCN; ++i) { LONG dn = g_rtSC[i].n - g_rtSC[i].ln; if (g_rtSC[i].ra && !usedS[i] && dn > bc) { bc = dn; bi = i; } }
+                    if (bi < 0) break;
+                    usedS[bi] = true;
+                    char sym[160], pf[16]; symName(g_rtSC[bi].ra, sym);
+                    logf("rt:   sync caller %s %s x%d in %d frames (%s/f, drain total for the op above)", sym, rtOpName(g_rtSC[bi].op), (int)bc, (int)fr30, perStr(bc, fr30, pf));
+                }
+                static bool usedL[RT_LSN]; memset(usedL, 0, sizeof(usedL));
+                for (int k = 0; k < 10; ++k) {
+                    int bi = -1; LONG bc = 0;
+                    for (int i = 0; i < RT_LSN; ++i) { LONG dn = g_rtLS[i].n - g_rtLS[i].ln; if (g_rtLS[i].ra && !usedL[i] && dn > bc) { bc = dn; bi = i; } }
+                    if (bi < 0) break;
+                    usedL[bi] = true;
+                    RtLockStat& e = g_rtLS[bi]; char sym[160], pf[16]; symName(e.ra, sym);
+                    logf("rt:   lock %s %s pool=%d fmt=%d usage=%X %dx%d flags=%X %s x%d in %d frames (%s/f)%s%s", (e.flags & 0x80000000u) ? "tex" : "surf", sym, (int)e.pool, (int)e.fmt, (unsigned)e.usage,
+                         (int)e.w, (int)e.h, (unsigned)(e.flags & 0x7FFFFFFFu), e.fast ? "DIRECT" : "sync", (int)bc, (int)fr30, perStr(bc, fr30, pf),
+                         !e.fast ? (e.who ? (e.exact ? " - its TEXTURE is named by a queued " : " - its texture's shared slot was stamped by ") : (e.exact ? " - it is named by a queued " : " - not tracked exactly yet / shared slot stamped by ")) : "",
+                         !e.fast ? (e.blocker != 0xFFFF ? rtOpName(e.blocker) : "(a call without an op: release / mirror / batch)") : "");
+                }
+            }
+            for (int i = 0; i < RT_SCN; ++i) if (g_rtSC[i].ra) g_rtSC[i].ln = g_rtSC[i].n;
+            for (int i = 0; i < RT_LSN; ++i) if (g_rtLS[i].ra) g_rtLS[i].ln = g_rtLS[i].n;
+        }
+        (void)m8; (void)pr; (void)lPresent;
+        lAsync = a; lSync = s; lRel = rl; lForeign = fo; lPresent = pr; lScope = sc; lDrain = dr; lBusy = bu; lBytes = by; lPWait = pw;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- test entry points (offline harness)
+#ifdef AOTR_SELFTEST   // offline-test export: built only into the test DLL
+extern "C" __declspec(dllexport) int __cdecl AotrRtTestInstall(void* dev, void* fx) {
+    (void)dev;
+    if (!g_pqpf.QuadPart) QueryPerformanceFrequency(&g_pqpf);
+    g_mkTid = GetCurrentThreadId();
+    rtInit();
+    if (!g_rtActive && !g_rtTried) rtInstall(fx);
+    return g_rtActive ? 1 : 0;
+}
+extern "C" __declspec(dllexport) void* __cdecl AotrRtTestScopedD3DX(const char* name) {   // wrapper that runs `name` as an exclusive scope
+    HMODULE hx = GetModuleHandleA("d3dx9_27.dll");
+    for (int i = 0; i < 14; ++i) if (hx && !strcmp(kRtX[i].name, name)) {
+        if (!g_rtXO[i]) g_rtXO[i] = (void*)GetProcAddress(hx, name);
+        return g_rtXO[i] ? kRtX[i].hook : NULL;
+    }
+    return NULL;
+}
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestToggle(int on) { InterlockedExchange(&g_rtWantOn, on ? 1 : 0); }
+#endif
+// v28: read the A/B record for the overlay's own session report (aotr_overlay.inc, aotr_report.txt). `which` 0 is
+// the LAST CLOSED segment, 1 the one being filled now; the fields are written straight into the caller's array:
+// [0] on, [1] ticks ms, [2] frames, [3] stalls100, [4] stalls250, [5] stalls500, [6] stallMs, [7] worstMs,
+// [8] queued calls, [9] queue peak, [10] waitMaxMs, [11] waitOp, [12] cpuMax, [13] cpuAvg.
+#ifdef AOTR_SELFTEST   // offline-test export: built only into the test DLL
+extern "C" __declspec(dllexport) int __cdecl AotrRtAbSeg(int which, long* out, int n) {
+    if (n < 14 || !out) return 0;
+    int i = (which ? g_abSeg : (g_abSeg ^ 1)) & 1;
+    const RtAbSeg* s = &g_ab[i];
+    out[0] = s->on; out[1] = (long)s->ticks; out[2] = s->frames; out[3] = s->stalls; out[4] = s->stalls250; out[5] = s->stalls500;
+    out[6] = s->stallMs; out[7] = s->worstMs; out[8] = (long)s->queuedCalls; out[9] = s->queuePeak; out[10] = s->waitMaxMs;
+    out[11] = (long)s->waitOp; out[12] = s->cpuMax; out[13] = s->cpuN ? (s->cpuSum / s->cpuN) : 0;
+    return 1;
+}
+extern "C" __declspec(dllexport) int __cdecl AotrRtAbSegs() { return (int)g_abSegs; }
+extern "C" __declspec(dllexport) int __cdecl AotrRtCoreMode() { return (int)g_rtCoreMode; }
+extern "C" __declspec(dllexport) int __cdecl AotrRtBypassFired() { return (int)g_rtBypassFired; }
+#endif
+// tests of the waits: a record that sends a window message from the render thread, records that take a while
+static void __stdcall rtTestSendRun(DWORD hwnd, DWORD msg) { SendMessageA((HWND)(ULONG_PTR)hwnd, msg, 0, 0); }
+static void __stdcall rtTestSleepRun(DWORD ms) { Sleep(ms); }
+#ifdef AOTR_SELFTEST   // offline-test export: built only into the test DLL
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestSend(void* hwnd, DWORD msg) {
+    RtRec* r = rtAlloc(2, 0); r->fn = (void*)&rtTestSendRun; r->op = 511; DWORD* A = rtArgs(r); A[0] = (DWORD)(ULONG_PTR)hwnd; A[1] = msg; rtCommit(r, 0);
+    g_rtCurOp = 511; rtDrain();
+}
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestBusy(DWORD ms, DWORD n) {
+    for (DWORD i = 0; i < n; ++i) { RtRec* r = rtAlloc(1, 0); r->fn = (void*)&rtTestSleepRun; r->op = 511; rtArgs(r)[0] = ms; rtCommit(r, 0); }
+    g_rtCurOp = 511; rtDrain();
+}
+extern "C" __declspec(dllexport) LONG __cdecl AotrRtTestWaiting() { return g_rtDrainWaiting; }
+extern "C" __declspec(dllexport) LONG __cdecl AotrRtTestPumps() { return g_rtNPump; }
+#endif
+// Benchmark aid: park the worker (it blocks on the exec lock at its next batch) so a timed burst measures the
+// game thread's enqueue path alone, without the worker's core, cache or SMT sibling in the picture.
+#ifdef AOTR_SELFTEST   // offline-test export: built only into the test DLL
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestAtlasAny(int on) { g_rtTMAtlasAny = on ? 1 : 0; }
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestHold(int on) {
+    if (on) { rtExecLock(); Sleep(2); } else LeaveCriticalSection(&g_rtExecCs);
+}
+#endif
+static void rtTestRadarModify(BYTE* bits, INT pitch, DWORD w, DWORD h, DWORD op, DWORD e) {     // the read-modify-write the radar test does
+    for (DWORD y = 0; y < h; ++y) for (DWORD x = 0; x < w; ++x) {
+        DWORD* px = (DWORD*)(bits + (INT)y * pitch + x * 4);
+        *px = op == 1 ? (*px * 3 + e + (x ^ (y << 3))) : ((*px >> 1) ^ (e * (x + 1)));
+    }
+}
+#ifdef AOTR_SELFTEST   // offline-test export: built only into the test DLL
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestRadarOp(void* surf, DWORD op, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e) {
+    DWORD s = (DWORD)(ULONG_PTR)surf;
+    if (GetCurrentThreadId() == g_rtMainTid && g_rtActive && !g_rtDirectScope) {                    // the bodies of the SurfaceClass hooks
+        if (op == 2) { if (rtTMClear(s, a, true)) return; }
+        else {
+            int pitch = 0;
+            void* p = op == 1 ? rtTMLockRect(s, &pitch, a, b, c, d, true) : (rtTMFind(s) ? rtTMLockAll(s, &pitch) : rtTMLockRect(s, &pitch, 0, 0, 128, 128, true));
+            if (p != RT_TM_NOT) {
+                if (p) { RtTexMir* m = rtTMFind(s); if (m) rtTestRadarModify((BYTE*)p, pitch, m->r - m->l, m->b - m->t, op, e); }
+                rtTMUnlock(s);
+                return;
+            }
+        }
+    }
+    void** vt = *(void***)surf;                                                                     // what the engine does without mirrors
+    struct { LONG l, t, rr, b; } rc = { (LONG)a, (LONG)b, (LONG)c, (LONG)d };
+    struct { INT pitch; void* bits; } lr = { 0, NULL };
+    DWORD hr = ((DWORD(__stdcall*)(void*, void*, void*, DWORD))vt[13])(surf, &lr, op == 1 ? &rc : NULL, op == 2 ? 0 : 0x800);
+    if ((LONG)hr < 0 || !lr.bits) return;
+    if (op == 2) { for (int y = 0; y < 128; ++y) memset((BYTE*)lr.bits + y * lr.pitch, (BYTE)a ? 0xFF : 0x00, 128 * 4); }
+    else rtTestRadarModify((BYTE*)lr.bits, lr.pitch, op == 1 ? c - a : 128, op == 1 ? d - b : 128, op, e);
+    ((DWORD(__stdcall*)(void*))vt[14])(surf);
+}
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestPixelOp(void* surf, DWORD x, DWORD y, DWORD v, DWORD mode) {
+    if (GetCurrentThreadId() == g_rtMainTid && g_rtActive && !g_rtDirectScope) { if (g_rtTMAny) rtTMPixel((DWORD)(ULONG_PTR)surf, x, y, v, mode); rtPixelRecord((DWORD)(ULONG_PTR)surf, x, y, v, mode); return; }
+    struct { LONG l, t, rr, b; } rc = { (LONG)x, (LONG)y, (LONG)x + 1, (LONG)y + 1 };
+    struct { INT pitch; void* bits; } lr = { 0, NULL };
+    void** vt = *(void***)surf;
+    ((DWORD(__stdcall*)(void*, void*, void*, DWORD))vt[13])(surf, &lr, &rc, 0);
+    if (lr.bits) switch (mode) { case 1: *(BYTE*)lr.bits = (BYTE)v; break; case 2: *(WORD*)lr.bits = (WORD)v; break; case 4: *(DWORD*)lr.bits = v; break; case 0x100: ((BYTE*)lr.bits)[3] = (BYTE)v; break; }
+    ((DWORD(__stdcall*)(void*))vt[14])(surf);
+}
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestShroudRect(void* surf, DWORD l, DWORD t, DWORD r, DWORD b, const BYTE* rows, DWORD bpp) {
+    DWORD sc[1] = { (DWORD)(ULONG_PTR)surf };                 // a SurfaceClass is the surface pointer
+    int pitch = 0;
+    BYTE* dst;
+    if (GetCurrentThreadId() == g_rtMainTid && g_rtActive && !g_rtDirectScope) dst = (BYTE*)hk_rtShroudLock(sc, NULL, &pitch, l, t, r, b);
+    else {                                                     // what 0x516090 does
+        struct { LONG l, t, rr, b; } rc = { (LONG)l, (LONG)t, (LONG)r, (LONG)b }; struct { INT pitch; void* bits; } lr = { 0, NULL };
+        ((DWORD(__stdcall*)(void*, void*, void*, DWORD))(*(void***)surf)[13])(surf, &lr, &rc, 0x800); pitch = lr.pitch; dst = (BYTE*)lr.bits;
+    }
+    DWORD w = r - l, rowBytes = w * bpp;
+    if (dst) for (DWORD y = 0; y < b - t; ++y) memcpy(dst + (INT)y * pitch, rows + y * rowBytes, rowBytes);
+    if (GetCurrentThreadId() == g_rtMainTid && g_rtActive && !g_rtDirectScope) hk_rtShroudUnlock(sc, NULL);
+    else ((DWORD(__stdcall*)(void*))(*(void***)surf)[14])(surf);
+}
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestSeqBase(DWORD base) {   // before install only: queue empty
+    g_rtPH.seq = base; g_rtWH.execSeq = base; g_rtDrainSeq = base;
+}
+extern "C" __declspec(dllexport) DWORD __cdecl AotrRtTestFxEpoch(int set, DWORD v) { if (set) g_rtFxEpoch = v; return g_rtFxEpoch; }   // the effect value table's counter: read, or placed (before install)
+#endif
+// The effect value table when its counter wraps (edge_test.exe): a table of its own, every entry written while the
+// counter stood at 1, the counter at its last number, one drop. No entry may count as current afterwards.
+#ifdef AOTR_SELFTEST   // offline-test export: built only into the test DLL
+extern "C" __declspec(dllexport) int __cdecl AotrRtTestFxWrap(char* out, int n) {
+    RtFxVal* keepV = g_rtFxV; DWORD keepE = g_rtFxEpoch; int fail = 0;
+    RtFxVal* t = (RtFxVal*)VirtualAlloc(NULL, (SIZE_T)RT_FXV * sizeof(RtFxVal), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!t) { if (out && n > 0) lstrcpynA(out, "FAIL  no memory for a table", n); return 1; }
+    for (int i = 0; i < RT_FXV; ++i) { t[i].fx = 0x1000 + i; t[i].h = 7; t[i].epoch = 1; t[i].nb = 4; }
+    g_rtFxV = t; g_rtFxEpoch = 0xFFFFFFFFu;
+    rtFxInvalAll();
+    int left = 0; for (int i = 0; i < RT_FXV; ++i) if (t[i].epoch == g_rtFxEpoch) ++left;
+    if (g_rtFxEpoch != 1 || left) fail = 1;
+    if (out && n > 200) wsprintfA(out, "%s  effect value table at its counter's wrap: the counter restarts at %u, and %d of %d old entries still count as current", fail ? "FAIL" : "ok  ", g_rtFxEpoch, left, RT_FXV);
+    g_rtFxV = keepV; g_rtFxEpoch = keepE;
+    VirtualFree(t, 0, MEM_RELEASE);
+    return fail;
+}
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestThreads(char* out, int n) {   // tid, description, ideal cpu, cpu time
+    int p = 0; out[0] = 0;
+    typedef HRESULT (WINAPI* GetDescF)(HANDLE, PWSTR*);
+    GetDescF gd = (GetDescF)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te; te.dwSize = sizeof(te); DWORD pid = GetCurrentProcessId();
+    if (Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        char name[64] = "?";
+        DWORD ideal = 0xFFFFFFFF; ULONG64 cpu = 0;
+        if (h) {
+            if (gd) { PWSTR w = NULL; if (SUCCEEDED(gd(h, &w)) && w) { WideCharToMultiByte(CP_ACP, 0, w, -1, name, 63, NULL, NULL); LocalFree(w); } }
+            ideal = SetThreadIdealProcessor(h, MAXIMUM_PROCESSORS);
+            FILETIME c, e, k, u; if (GetThreadTimes(h, &c, &e, &k, &u)) cpu = ((((ULONG64)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((ULONG64)u.dwHighDateTime << 32) | u.dwLowDateTime)) / 10000;
+            CloseHandle(h);
+        }
+        if (p < n - 80) p += wsprintfA(out + p, "  %u%s%s [%s] ideal=%d cpu=%dms\n", te.th32ThreadID, te.th32ThreadID == g_rtMainTid ? " MAIN" : "",
+                                       te.th32ThreadID == g_rtWorkerTid ? " RTWORKER" : "", name, (int)ideal, (int)cpu);
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+}
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestCpu(char* out, int n) {
+    int p = 0; p += wsprintfA(out + p, "main cpus:");
+    for (int i = 0; i < 64 && p < n - 40; ++i) if (g_rtCpuHistM[i]) p += wsprintfA(out + p, " %d:%d", i, (int)g_rtCpuHistM[i]);
+    p += wsprintfA(out + p, " | worker cpus:");
+    for (int i = 0; i < 64 && p < n - 40; ++i) if (g_rtCpuHistW[i]) p += wsprintfA(out + p, " %d:%d", i, (int)g_rtCpuHistW[i]);
+    for (int i = 0; i < 64; ++i) { g_rtCpuHistW[i] = 0; g_rtCpuHistM[i] = 0; }
+}
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestStatsV4(char* out, int n) {
+    if (!out || n < 64) return;
+    char wm[16];
+    wsprintfA(out, "direct_locks=%d direct_unlocks=%d locked_calls=%d mirror=%d pixel_records=%d shroud_records=%d pb_proxies=%d qcache_hit=%d miss=%d seq=%u exec=%u | drains=%d waits=%d (timeouts %d, %s ms) worker sleeps=%d (timeouts %d) | tex mirrors adopted %d locks %d dropped %d failed %d | buf mirrors adopted %d locks %d dropped %d failed %d | annotation reads kept %d | evicted %d",
+              (int)g_rtNDirectLock, (int)g_rtNDirectUnlock, (int)g_rtNLocked, (int)g_rtNMirror, (int)g_rtNPixel, (int)g_rtNShroud, (int)g_rtNPBProxy, (int)g_rtQHit, (int)g_rtQMiss, g_rtPH.seq, g_rtWH.execSeq,
+              (int)g_rtDrains, (int)g_rtWaitCalls, (int)g_rtWaitTimeouts, msStr(rd64(&g_rtWaitTicks), 1, wm), (int)g_rtWorkerSleeps, (int)g_rtWorkerTimeouts, (int)g_rtNTMAdopt, (int)g_rtNTMLock, (int)g_rtNTMDrop, (int)g_rtNTMFail, (int)g_rtNBMAdopt, (int)g_rtNBMLock, (int)g_rtNBMDrop, (int)g_rtNBMFail, (int)g_rtNAnnHit, (int)g_rtNBMEvict);
+    wsprintfA(out + lstrlenA(out), " | fx-dedupe skipped=%d written=%d whole-drops=%d (off-queue %d, block %d, reset %d, other %d) block-drops=%d | off-queue from: other-thread %d (render worker %d) rt-off %d direct-scope %d | by setter: bool %d int %d float %d vector %d matrix %d matrixT %d texture %d raw %d", (int)g_rtNFxSkip, (int)g_rtNFxKept, (int)g_rtNFxInval, (int)g_rtNFxInvalWhy[0], (int)g_rtNFxInvalWhy[1], (int)g_rtNFxInvalWhy[2], (int)g_rtNFxInvalWhy[3], (int)g_rtNFxBlkInval, (int)g_rtNFxOffWho[0], (int)g_rtNFxOffWho[3], (int)g_rtNFxOffWho[1], (int)g_rtNFxOffWho[2], (int)g_rtNFxOffSlot[22], (int)g_rtNFxOffSlot[26], (int)g_rtNFxOffSlot[30], (int)g_rtNFxOffSlot[34], (int)g_rtNFxOffSlot[38], (int)g_rtNFxOffSlot[44], (int)g_rtNFxOffSlot[52], (int)g_rtNFxOffSlot[78]);
+}
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestStats(char* out, int n) {
+    if (!out || n < 64) return;
+    char m1[16], m2[16];
+    wsprintfA(out, "active=%d queued=%d sync=%d release=%d scope=%d foreign=%d presents=%d drain_ms=%s busy_ms=%s",
+              (int)g_rtActive, (int)g_rtNAsync, (int)g_rtNSync, (int)g_rtNRelease, (int)g_rtNScope, (int)g_rtNForeign, (int)g_rtNPresent,
+              msStr(rd64(&g_rtDrainTicks), 1, m1), msStr(rd64(&g_rtBusyTicks), 1, m2));
+}
+#endif
+
+// ---------------------------------------------------------------- frame capture: the queue side (see aotr_capture.inc)
+static void capRecord(RtRec* r, DWORD po) {                        // game thread, from rtCommit
+    const DWORD* a = rtArgs(r); const BYTE* P = rtPayload(r);
+    capPrintf("R %s k=%u n=%u", rtOpName(r->op), (unsigned)r->kind, (unsigned)r->nargs);
+    for (DWORD i = 0; i < r->nargs && i < 16; ++i) capPrintf(" %08X", a[i]);
+    if (po) { capPrintf(" | pl=%u h=%08X ", po, capHash(P, po)); capHex(P, po < 256 ? po : 256); }
+    capPrintf("\n");
+}
+static LONG g_capSavedFx = 1, g_capSavedDs = 1;
+static void capStart(LONG frames) {
+    if (g_rtFxRec) rtFxClose();
+    if (g_rtPxRec) rtPxClose();
+    g_capSavedFx = g_rtFxBatchOn; g_rtFxBatchOn = 0;               // every effect parameter write as its own record
+    g_capSavedDs = g_rtDs.on; g_rtDs.on = 0; rtDsInvalAll();        // and every vertex-input call the engine makes
+    g_capFramesLeft = frames; g_capPos = 0;
+    capPrintf("F capture round %d begins at frame %d\n", (int)g_capRounds + 1, (int)g_mkFrames);
+    g_capOn = 1;
+}
+static void capStop() {
+    g_capOn = 0;
+    if (g_rtFxRec) rtFxClose();
+    if (g_rtPxRec) rtPxClose();
+    g_rtFxBatchOn = g_capSavedFx; g_rtDs.on = g_capSavedDs; rtDsInvalAll();
+    g_capRounds++; g_capLastTick = GetTickCount(); g_capBusyWriting = 1;
+    HANDLE h = CreateThread(NULL, 0, capWriter, NULL, 0, NULL); if (h) CloseHandle(h); else g_capBusyWriting = 0;
+}
+static void capFrameTick() {                                       // game thread, once per frame, before the logic call
+    static LONG lastPush = 0;
+    LONG pushes = g_rlPushN[PH_SHADOW], d = pushes - lastPush; lastPush = pushes;      // shadow casters pushed during the last frame
+    if (g_capOn) { if (--g_capFramesLeft <= 0) capStop(); else capPrintf("F frame boundary at frame %d\n", (int)g_mkFrames); return; }
+    if (g_capRounds >= 3 || g_capBusyWriting || !g_rtActive) return;
+    if (d >= 400 && GetTickCount() - g_capLastTick > 20000) capStart(2);
+}
+#ifdef AOTR_SELFTEST   // offline-test export: built only into the test DLL
+extern "C" __declspec(dllexport) void __cdecl AotrRtTestCaptureTick(int frame) {   // offline harness: capture frames 50-51
+    if (!g_capBuf) g_capBuf = (char*)VirtualAlloc(NULL, CAP_CAP, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!g_capBuf) return;
+    if (g_capOn) { if (--g_capFramesLeft <= 0) capStop(); else capPrintf("F frame boundary\n"); return; }
+    if (frame == 50) capStart(2);
+}
+#endif

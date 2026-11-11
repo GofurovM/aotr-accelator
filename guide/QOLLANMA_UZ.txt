@@ -1,0 +1,54 @@
+﻿AOTR ACCELERATOR - qisqa qo'llanma
+=================================
+
+Bu nima
+  Age of the Ring uchun kichik qo'shimcha: katta janglarda kamroq qotish, barqarorroq 30 fps.
+  Faqat xotirada ishlaydi - game.dat va AOTR papkasi hech qachon o'zgartirilmaydi.
+  Multiplayer uchun xavfsiz: o'yin mantig'iga tegilmaydi, boshqa o'yinchilarda bo'lishi shart emas.
+  Har qanday kompyuterda: kichik kompyuterda (4 GB xotira, ikki yadro) ortiqcha xotira yoki
+  yadro talab qiladigan qismlar o'zi kichrayadi yoki o'chadi - o'yin ular uchun to'lamaydi.
+
+O'RNATISH (bir marta, bitta bosish)
+  1. Papkani istalgan joyga zipdan chiqaring.
+  2. AOTR_ACCELERATOR.exe ni ikki marta bosing va administrator so'roviga "Ha" (Yes) deng.
+     Windows "Windows protected your PC" desa: More info (Batafsil) -> Run anyway (Baribir ishga tushirish).
+  3. "O'rnatildi" degan oyna chiqadi. O'yinni hozir ochish uchun "Ha" ni bosing.
+  Tamom. Zipdan chiqarilgan papka endi kerak emas - o'chirib tashlashingiz mumkin.
+  (Dastur C:\ProgramData\AOTR Accelerator ga o'rnatiladi.)
+
+O'YNASH
+  - AOTR launcherini odatdagidek oching yoki ish stolidagi yangi "AOTR Accelerator" yorlig'ini bosing.
+    Tezlatgich o'yinga o'zi yuklanadi - boshqa hech narsa qilish shart emas.
+  - Dastur Windows bilan birga ko'rinmasdan ishga tushadi va kutib turadi; hech qachon ikki marta ishlamaydi.
+  - O'yin ichida yuqori o'ng burchakda kichik belgi:
+      yashil = hammasi ishlayapti
+      sariq  = tekshiruv bitta qismni o'chirdi (o'yin odatdagidek davom etadi)
+      qizil  = asosiy qism ishlamayapti ("Qizil bo'lsa" bo'limiga qarang)
+    F7 belgini yashiradi yoki qayta ko'rsatadi.
+
+SOAT YONIDAGI UZUK BELGISI
+  - oltin = hammasi joyida, sariq = bitta qism o'chiq, qizil = ishlamayapti.
+  - Ikki marta bosish: Age of the Ring ni ochadi.
+  - O'ng tugma: AOTR'ni ochish, Windows bilan birga (yoqish/o'chirish), Papkani ochish (log),
+    O'chirib tashlash, Chiqish.
+
+QIZIL BO'LSA
+  - "DLL topilmadi" yoki "yuklanmadi": antivirus to'sgan bo'lishi mumkin. Antivirus istisnolariga
+    C:\ProgramData\AOTR Accelerator papkasini qo'shing va qayta o'rnating.
+  - "render thread off - Direct3D is not DXVK": o'yin DXVK o'rniga Windows'ning o'z Direct3D sini
+    ishlatyapti; AOTR launcherining grafika sozlamalarini tekshiring (DXVK yoqilgan bo'lsin).
+
+BILIB QO'YING
+  - Har 5 o'yindan keyin, menyuga qaytganda, tezlatgich o'zining vaqtinchalik jadvallarini tozalaydi.
+    O'yin yuklab olgan narsalar saqlanadi, shuning uchun keyingi o'yinlar ham tez bo'ladi.
+  - Bitta sessiyada 2.5 soat o'ynagandan keyin o'yinni qayta ochish taklif qilinadi -
+    shunda grafika toza qoladi.
+  - O'yin ishlayotganda Windows "Yuqori unumdorlik" (High performance) quvvat rejimiga o'tadi,
+    o'yin yopilganda avvalgi holiga qaytadi. O'z rejimingizni saqlash uchun
+    C:\ProgramData\AOTR Accelerator papkasida POWER_OFF nomli bo'sh fayl yarating.
+
+YANGILASH
+  O'yinni yoping, keyin yangi zipdagi AOTR_ACCELERATOR.exe ni ishga tushiring - eskisi almashtiriladi.
+
+O'CHIRIB TASHLASH
+  Soat yonidagi uzukni o'ng tugma bilan bosing -> O'chirib tashlash.

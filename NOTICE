@@ -1,0 +1,6 @@
+This project is a fork of "BFME2 Accelerator" by OhadBaehr, released under the MIT license.
+Original source: https://github.com/OhadBaehr/bfme2-accelerator (see LICENSE).
+The changes and additions made in this fork are released under the same MIT license.
+
+Not affiliated with or endorsed by Electronic Arts, the Age of the Ring team, or the Open-BFME project.
+No game files are included or modified on disk: the DLL is injected at runtime only.
