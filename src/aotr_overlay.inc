@@ -504,7 +504,7 @@ static void ovSessionEnd() {
 // test-11: the player could not tell whether the DLL was running. The read-out was a window, and the game runs in
 // exclusive fullscreen (Options.ini "Resolution = 1920 1080", DXVK's log "Windowed: false"): no window of ours is ever
 // drawn over that. So v31 paints the read-out into the game's own picture, right before it is shown:
-//   - for the first 30 s of pictures (and 5 s after F7 brings it back) a banner: "AOTR V84 BUILD 134 RUNNING" and
+//   - for the first 30 s of pictures (and 5 s after F7 brings it back) a banner: "AOTR V85 BUILD 135 RUNNING" and
 //     which Direct3D 9 draws on which chip ("DXVK / NVIDIA", "WINDOWS D3D9 / NVIDIA");
 //   - always, while shown, one small line: fps, the longest frame of the last second, the long frames so far;
 //   - on F7 for 3 s: "AOTR PANEL SHOWN (F7)" or "AOTR PANEL HIDDEN (F7)", so a press always has an answer.
@@ -627,7 +627,7 @@ static void ovIfBuild(bool banner, int msg, bool show) {
         LONG b = ovText(&g_ovIfRen, x, y, 2, t->renderer); if (b > w) w = b; y += 7 * 2 + 6;
     }
     if (show) {
-        LONG c = ovText(&g_ovIfLn, x, y, 2, t ? t->line : "AOTR V84 B134"); if (c > w) w = c; y += 7 * 2 + 6;
+        LONG c = ovText(&g_ovIfLn, x, y, 2, t ? t->line : "AOTR V85 B135"); if (c > w) w = c; y += 7 * 2 + 6;
         LONG f = t ? t->fps10 : 0;
         g_ovIfLnCol = f >= 280 ? 0xFF40FF40u : (f >= 200 ? 0xFFFFFF40u : 0xFFFF6040u);
     }
@@ -824,7 +824,7 @@ static int ovAbFps10(const long* ab) { return ab[1] > 0 ? (int)((LONG64)ab[2] * 
 // The exact switch set that produced a reading, so "the best run" can be compared with this one. The names
 // are the INI's own, shortened, and the numbers are read out of the INI itself - never invented.
 static void ovSwitches(char* out, int cap) {                // v30: one fixed set - the build says what it is
-    lstrcpynA(out, "v84 build 134 (one fixed set)", cap);
+    lstrcpynA(out, "v85 build 135 (one fixed set)", cap);
 }
 static void ovLoadBest() {
     char p[MAX_PATH]; aotrPath(p, "aotr_best.txt");
@@ -1128,7 +1128,7 @@ static DWORD WINAPI ovThread(void*) {
         g_ovPh = 10; g_ovPhAt = GetTickCount();                                // the panel text
         { static LONG lastTp = 0; LONG tp = g_tpNTex; LONG tpS = tp - lastTp; lastTp = tp;
         wsprintfA(g_ovCat,
-                  "AOTR accel v84 build 134   F7 = hide   %d min\r\n"
+                  "AOTR accel v85 build 135   F7 = hide   %d min\r\n"
                   "fps %d.%d   average(5s) %d.%d   frame %d ms   longest %d ms\r\n"
                   "hitches(100ms+) %d   longest this session %d ms   disk waits %d ms\r\n"
                   "cpu %d.%02d cores   ram %u MB   threads %u   ground patches %d/s\r\n"
@@ -1167,8 +1167,8 @@ static DWORD WINAPI ovThread(void*) {
             if (!bad) wsprintfA(ren, "MP CHECK OK: 9 PARTS, %d CHECKS, 0 DIFFERENT%s", (int)chk, net ? " (NETWORK GAME)" : "");
             else wsprintfA(ren, "MP CHECK: %d DIFFERENT! THAT PART TURNED ITSELF OFF - SEND THE LOG", (int)bad);
             g_ovMpChk = chk; g_ovMpBad = bad; }
-          wsprintfA(ln, "AOTR B%d  LOGIC %d.%d/S  FPS %d.%d  LONGEST %d MS  HITCHES %d  %s", 134, (int)(g_ovLogic10 / 10), (int)(g_ovLogic10 % 10), (int)(fps10 / 10), (int)(fps10 % 10), (int)worst, (int)g_ovSt100, g_ovMpBad ? "MP: DIFFERENT!" : "MP: OK");
-          ovIfPublish("AOTR V84 BUILD 134 RUNNING", ren, ln, fps10); }
+          wsprintfA(ln, "AOTR B%d  LOGIC %d.%d/S  FPS %d.%d  LONGEST %d MS  HITCHES %d  %s", 135, (int)(g_ovLogic10 / 10), (int)(g_ovLogic10 % 10), (int)(fps10 / 10), (int)(fps10 % 10), (int)worst, (int)g_ovSt100, g_ovMpBad ? "MP: DIFFERENT!" : "MP: OK");
+          ovIfPublish("AOTR V85 BUILD 135 RUNNING", ren, ln, fps10); }
         { static LONG lastKeys = 0; LONG kp = g_ovKeyPresses;
           if (kp != lastKeys) { lastKeys = kp; logf("overlay: F7 pressed (%d so far) - the panel is now %s.", (int)kp, g_ovShow ? "SHOWN" : "HIDDEN"); } }
         { static LONG paintSaid = 0;
@@ -1192,7 +1192,7 @@ static DWORD WINAPI ovThread(void*) {
                 LONG avgFps10 = g_ovRepSec ? (LONG)(g_ovRepFrames * 10 / g_ovRepSec) : 0;   // x10, like everywhere else
                 int cpuAvg = g_ovRepCpuN ? (int)(g_ovRepCpuSum / g_ovRepCpuN) : 0;
                 int c0 = (int)g_ovStCls[0], c1 = (int)g_ovStCls[1], c2 = (int)g_ovStCls[2], c3 = (int)g_ovStCls[3];
-                n = ovAppend(g_ovB, sizeof(g_ovB), n, g_vanilla ? "AOTR accel v84 (diagnostics, build 134) - VANILLA: THE GAME AS IT IS (measurement only) - REPORT\r\n\r\n" : "AOTR accel v84 (diagnostics, build 134) - REPORT   (rewritten every 60 seconds while the game runs)\r\n\r\n");
+                n = ovAppend(g_ovB, sizeof(g_ovB), n, g_vanilla ? "AOTR accel v85 (diagnostics, build 135) - VANILLA: THE GAME AS IT IS (measurement only) - REPORT\r\n\r\n" : "AOTR accel v85 (diagnostics, build 135) - REPORT   (rewritten every 60 seconds while the game runs)\r\n\r\n");
                 n = ovAppend(g_ovB, sizeof(g_ovB), n, "play time %d min %d s | average %d.%d fps, best 5 s %d.%d fps (at %d s), peak %d.%d\r\n",
                              (int)(g_ovRepSec / 60), (int)(g_ovRepSec % 60), (int)(avgFps10 / 10), (int)(avgFps10 % 10),
                              (int)(g_ovBest5 / 10), (int)(g_ovBest5 % 10), (int)g_ovBest5At, (int)(g_ovPeak10 / 10), (int)(g_ovPeak10 % 10));
@@ -1352,7 +1352,7 @@ extern "C" __declspec(dllexport) int __cdecl AotrPresentCount() { return (int)g_
 // 1 the line only, 2 hidden with the "HIDDEN" message, 3 hidden (nothing). box: x1,y1,x2,y2 of what was painted.
 extern "C" __declspec(dllexport) int __cdecl AotrInFrameTest(void* dev, int mode, int* box) {
     InterlockedExchange(&g_ovIfWant, 1); g_ovIfDead = 0; g_ovIfOk = 0; g_ovIfNextChk = 0; g_ovIfSig = -1;
-    ovIfPublish("AOTR V84 BUILD 134 RUNNING", "WINDOWS D3D9 / NVIDIA - F7 HIDES", "AOTR B134 FPS 29.5  LONGEST 45 MS  HITCHES 3", 295);
+    ovIfPublish("AOTR V85 BUILD 135 RUNNING", "WINDOWS D3D9 / NVIDIA - F7 HIDES", "AOTR B135 FPS 29.5  LONGEST 45 MS  HITCHES 3", 295);
     LONG now = (LONG)GetTickCount();
     g_ovIfFirst = (mode == 0) ? now : now - 60000; g_ovIfBannerUntil = 0;
     g_ovShow = (mode <= 1) ? 1 : 0;

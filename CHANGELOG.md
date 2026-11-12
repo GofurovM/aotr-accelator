@@ -4,6 +4,21 @@ What each version changed, newest first. The engineering detail (addresses, proo
 [NOTES.md](NOTES.md); the off switches are in [README.md](README.md). Every part that touches the game's logic proves
 itself against the engine's own code, and turns itself off (yellow light) on any difference.
 
+## v85 (build 135) - works on AOTR updates (10.01), fewer antivirus warnings
+- **AOTR 10.01 showed a red light**: the check for a newer game.dat compared 10 places in the game's import table,
+  which Windows fills in when the game starts - so every update looked changed, on every PC. The import table is
+  never compared now. The anchor table: 664 places, all equal on AOTR 10.0.
+- **An update no longer turns everything off.** Each place the DLL uses is tied to the source files that use it;
+  when an update really changes one, only the parts in those files stay off and the rest runs. Only a change in the
+  core (the frame and logic plumbing) turns all the address-tied parts off, as before. A newer game.dat no longer
+  needs the same size, checksum and entry point - the same 2.02 build stamp is enough to look further.
+- **Antivirus**: the starter no longer enables the debug privilege (it was never needed - the game runs as the same
+  user) and asks only for the rights the load needs; the DLL now has a version resource, and both files say who made
+  them. Heuristic warnings may still appear (the DLL is still loaded into the game), but these were the strongest
+  signals.
+- The crash log no longer writes Windows' own memory probes (IsBadStringPtr and friends fault on purpose and handle
+  it themselves) as crashes.
+
 ## v84 (build 134) - the v83 test's freeze fixed
 - **The game hung after 15 minutes because of the diagnostics build's glitch hunt**: its switch from FULL to CORE
   told the game thread to call the graphics driver directly before the render worker had finished the calls already

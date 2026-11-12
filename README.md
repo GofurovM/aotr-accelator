@@ -136,6 +136,10 @@ What we are facing at the moment, most important first:
   BitDefender engine) flag the package as a generic or heuristic "trojan". The starter loads the DLL into the game
   with the standard Windows calls that trainers and overlays use, asks for administrator rights and starts with
   Windows - together that looks suspicious to them. The code is here for anyone to read.
+- **AOTR updates.** The DLL checks every place in game.dat it uses. Since v85 an update that changes some of them
+  turns off only the parts that use those places; the rest keeps running (before, AOTR 10.01 turned everything off
+  because of a mistake in that check). A big update can still change the core, and then the light is red until a
+  new version of the accelerator knows it.
 - **DXVK is needed for the render thread.** With Windows' own Direct3D 9 instead of DXVK, the render thread is
   not used and the status light is red. Turn DXVK on in the AOTR launcher's graphics settings.
 - **The heaviest battles still dip to about 18-22 fps.** The rest of the cost is the engine's own logic and
@@ -151,6 +155,6 @@ What we are facing at the moment, most important first:
 - **32-bit address space.** The game is a 32-bit process (4 GB with Large Address Aware) and Age of the Ring
   alone uses 2-2.5 GB of it. That is why nothing is loaded into the game ahead of time - read-ahead goes only to
   the Windows file cache.
-- **Fixed recently:** the diagnostics build could freeze the game when its glitch hunt switched the render thread
+- **Fixed recently:** AOTR 10.01 showed a red light because of a mistake in the update check (v85); the diagnostics build could freeze the game when its glitch hunt switched the render thread
   (v84); a module lookup could miss a module that Age of the Ring added to a living unit (v83). See
   [CHANGELOG.md](CHANGELOG.md).

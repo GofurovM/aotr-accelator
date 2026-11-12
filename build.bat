@@ -20,7 +20,10 @@ echo === [1/3] rpmalloc ===
 cl /nologo /O2 /MT /W3 /I..\vendor\rpmalloc /c ..\vendor\rpmalloc\rpmalloc.c
 if errorlevel 1 ( echo RPMALLOC FAILED & exit /b 5 )
 echo === [2/3] bfme2_accel.dll %DIAG% ===
-cl /nologo /O2 /MT /W3 /DAOTR_PROD %DIAG% /LD /I..\vendor\rpmalloc /Fe:"%~dp0out\bfme2_accel.dll" aotr_accel.cpp rpmalloc.obj /link kernel32.lib user32.lib advapi32.lib gdi32.lib /MAP:"%~dp0out\bfme2_accel.map"
+rem v85: the DLL carries a version resource too (who made it, what it is - files without one look suspicious to antivirus heuristics)
+rc /nologo /fo bfme2_accel.res bfme2_accel.rc
+if errorlevel 1 ( echo DLL RESOURCES FAILED & exit /b 2 )
+cl /nologo /O2 /MT /W3 /DAOTR_PROD %DIAG% /LD /I..\vendor\rpmalloc /Fe:"%~dp0out\bfme2_accel.dll" aotr_accel.cpp rpmalloc.obj bfme2_accel.res /link kernel32.lib user32.lib advapi32.lib gdi32.lib /MAP:"%~dp0out\bfme2_accel.map"
 if errorlevel 1 ( echo DLL BUILD FAILED & exit /b 2 )
 echo === [3/3] aotr_start.exe (the starter: install, tray, autostart) ===
 rc /nologo /fo aotr_start.res aotr_start.rc

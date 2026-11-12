@@ -2821,11 +2821,11 @@ static bool aotrSecondCopy() {
 // by side and a log has to say which one it is without opening the DLL. The banner carries the folder the DLL was
 // loaded from, so a log can never be mistaken for another test folder's. v30: it is the first line of every session.
 #ifdef AOTR_DIAG
-#define AOTR_RELEASE "AOTR accel v84 (diagnostics)"
+#define AOTR_RELEASE "AOTR accel v85 (diagnostics)"
 #else
-#define AOTR_RELEASE "AOTR accel v84"
+#define AOTR_RELEASE "AOTR accel v85"
 #endif
-#define AOTR_BUILDNO 134                                  // (also written out in aotr_overlay.inc: the in-frame banner and ovSwitches)
+#define AOTR_BUILDNO 135                                  // (also written out in aotr_overlay.inc: the in-frame banner and ovSwitches)
 static_assert(AOTR_BUILDNO == AOTR_BUILDNO_GUARD, "aotr_guard.inc: AOTR_BUILDNO_GUARD must equal AOTR_BUILDNO");
 static void aotrBanner() {
     HMODULE selfMod = NULL;
@@ -2972,16 +2972,55 @@ static DWORD WINAPI aotrProdReport30(LPVOID) {
 }
 // v72: the places in game.dat this DLL uses (tools/gen_anchors.py) - do they hold the verified build's bytes?
 #include "aotr_anchors.inc"
-static bool aotrAnchorsHold() {
-    int bad = 0; DWORD first = 0;
-    for (int i = 0; i < (int)(sizeof(kAnchors) / sizeof(kAnchors[0])); ++i) {
+// v85: checked per source file. An anchor that differs turns off only the parts whose own files name that address;
+// the core files (the build's frame and logic plumbing) still decide for everything. The import address table is never
+// compared: the loader fills it at run time (the tool leaves it out, and this skips it again in case it ever reappears).
+static unsigned __int64 g_anchorBad = 0;               // bit i: kAnchorFiles[i] names a place this game.dat changed
+static int aotrAnchorFile(const char* name) {
+    for (int i = 0; i < (int)(sizeof(kAnchorFiles) / sizeof(kAnchorFiles[0])); ++i) if (!lstrcmpiA(kAnchorFiles[i], name)) return i;
+    return -1;                                          // the file names no anchored address
+}
+static bool aotrPartOk(const char* file) { int i = aotrAnchorFile(file); return i < 0 || !((g_anchorBad >> i) & 1); }
+// an engine part whose own places in game.dat are intact (both files, when it uses two)
+static bool aotrPart(const char* name, const char* file, const char* file2 = NULL) {
+    if (aotrPartOk(file) && (!file2 || aotrPartOk(file2))) return true;
+    logf("%s: not installed - this game.dat changed a place it uses (the rest is not affected).", name);
+    return false;
+}
+static bool aotrInIat(BYTE* base, DWORD va, DWORD n) {
+    __try {
+        IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+        IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!dd.VirtualAddress) return false;
+        for (IMAGE_IMPORT_DESCRIPTOR* id = (IMAGE_IMPORT_DESCRIPTOR*)(base + dd.VirtualAddress); id->FirstThunk; ++id) {
+            DWORD lo = (DWORD)(ULONG_PTR)base + id->FirstThunk, hi = lo;
+            while (*(DWORD*)(ULONG_PTR)hi) hi += 4;
+            if (va < hi + 4 && va + n > lo) return true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+static bool aotrAnchorsHold(BYTE* base) {
+    static const char* const kCore[] = { "aotr_accel.cpp", "aotr_frameprof.inc", "aotr_modtime.inc", "aotr_logicspread.inc", "aotr_sched.inc", "aotr_guard.inc" };
+    int bad = 0, n = (int)(sizeof(kAnchors) / sizeof(kAnchors[0]));
+    g_anchorBad = 0;
+    for (int i = 0; i < n; ++i) {
+        if (aotrInIat(base, kAnchors[i].va, kAnchors[i].n)) continue;
         bool same = false;
         __try { same = memcmp((const void*)(ULONG_PTR)kAnchors[i].va, kAnchors[i].b, kAnchors[i].n) == 0; } __except (EXCEPTION_EXECUTE_HANDLER) { same = false; }
-        if (!same) { if (!bad) first = kAnchors[i].va; ++bad; }
+        if (!same) { ++bad; g_anchorBad |= kAnchors[i].files; }
     }
-    if (bad) logf("init: a newer game.dat changed %d of the %d places this DLL uses (the first at %08X) - the parts tied to addresses stay off until it is verified.",
-                  bad, (int)(sizeof(kAnchors) / sizeof(kAnchors[0])), first);
-    return bad == 0;
+    if (!bad) return true;
+    char ln[700]; int q = 0;
+    for (int i = 0; i < (int)(sizeof(kAnchorFiles) / sizeof(kAnchorFiles[0])) && q < 600; ++i)
+        if ((g_anchorBad >> i) & 1) q += wsprintfA(ln + q, " %s", kAnchorFiles[i]);
+    ln[q] = 0;
+    bool core = false;
+    for (int k = 0; k < (int)(sizeof(kCore) / sizeof(kCore[0])); ++k) if (!aotrPartOk(kCore[k])) core = true;
+    logf("init: this game.dat changed %d of the %d places this DLL uses - named in:%s.%s", bad, n, ln,
+         core ? " The engine's frame and logic plumbing is among them: the parts tied to addresses stay off." :
+                " Only the parts in those files stay off; the rest of them run.");
+    return !core;
 }
 static DWORD WINAPI initThread(LPVOID) {
     rotateLog();                                     // keep the log readable: >64 MB is renamed, never deleted
@@ -3056,13 +3095,14 @@ static DWORD WINAPI initThread(LPVOID) {
             logf("init: %s (.text %08X). %s", hit->name, textHash,
                  g_engineHooks ? "Its verified addresses may be used (ground patch textures, render list)." :
                  "Only the parts that do not depend on this build's addresses are installed (render thread, heap, preshader cache, fast CRT).");
-        } else if (family && nt->FileHeader.TimeDateStamp == 0x460DA09E && (DWORD)imgSize == 0x00AD4000 &&
-                   nt->OptionalHeader.CheckSum == 0x00ADC2F6 && nt->OptionalHeader.AddressOfEntryPoint == 0x0063D082 && aotrAnchorsHold()) {
+        } else if (family && nt->FileHeader.TimeDateStamp == 0x460DA09E && aotrAnchorsHold(base)) {
+            // v85: the same 2.02 compile (its time stamp) is enough to look further - size, checksum and entry point may
+            // change with an AOTR update; the anchors decide, part by part
             // v72: an AOTR update that changed game.dat only where this DLL never looks (AOTR 10: 15 bytes in the AI's
             // target search) - every address the source names still holds the verified build's bytes
             g_engineHooks = 1;
-            logf("init: a newer AOTR game.dat (.text %08X) - its code differs from the verified build, but all %d places this DLL uses hold the same bytes. Its verified addresses may be used.",
-                 textHash, (int)(sizeof(kAnchors) / sizeof(kAnchors[0])));
+            logf("init: a newer AOTR game.dat (.text %08X) - its code differs from the verified build; %s",
+                 textHash, g_anchorBad ? "the parts whose places are intact may run (see above)." : "every place this DLL uses holds the same bytes. Its verified addresses may be used.");
         } else if (family) {
             g_engineHooks = 0;
             logf("init: an unrecognised build of this engine (.text %08X, stamp %08X size %08X sum %08X entry %08X). "
@@ -3203,45 +3243,45 @@ static DWORD WINAPI initThread(LPVOID) {
     installOverlay(true);                            // v71: the status light only (green / yellow / red, F7)
 #endif
     if (g_engineHooks) {                             // anchored to absolute addresses inside one verified build
-        installW3dLock();                            // v54: the W3D render lock (kernel mutex 0xDD1FD8) kept in user mode - before W3D makes it (W3DLOCK_OFF)
-        installRlSort();                             // render list sort / push / clear without reference-count churn (exact, self-checked)
+        if (aotrPart("w3dlock", "aotr_w3dlock.inc")) installW3dLock();                            // v54: the W3D render lock (kernel mutex 0xDD1FD8) kept in user mode - before W3D makes it (W3DLOCK_OFF)
+        if (aotrPart("rlsort", "aotr_rlsort.inc")) installRlSort();                             // render list sort / push / clear without reference-count churn (exact, self-checked)
         // v39: the radar (minimap) and the shroud through the render queue - lost from the install list in v30 (c51fe95).
         // test-20: the radar code (0x44C000..0x451000) was 13-17% of the client step and its per-pixel writes went through
         // a synchronous surface lock each (a wait for the whole render queue, ~650 a battle frame). Pixel writes queued in
         // runs, shroud rows staged, radar textures written through CPU mirrors - same calls on the device, same order.
         // Off: RADARHOOKS_OFF next to the DLL.
         { char mk[MAX_PATH];
-          if (GetFileAttributesA(aotrPath(mk, "RADARHOOKS_OFF")) == INVALID_FILE_ATTRIBUTES) rtInstallEngineHooks();
+          if (GetFileAttributesA(aotrPath(mk, "RADARHOOKS_OFF")) == INVALID_FILE_ATTRIBUTES) { if (aotrPart("rt radar", "aotr_rt.inc", "aotr_rtmirror.inc")) rtInstallEngineHooks(); }
           else logf("rt: RADARHOOKS_OFF is present - radar pixels, shroud and radar textures stay synchronous."); }
-        installTerrain();                            // each new ground patch texture built on every core (exact, self-checked)
-        installTerrainKeep();                        // v46: patches out of view keep their textures (camera turning: 2645 rebuilt in 5 s); hash-checked; TERRAINKEEP_OFF
+        if (aotrPart("terrain", "aotr_terrain.inc")) installTerrain();                            // each new ground patch texture built on every core (exact, self-checked)
+        if (aotrPart("terrainkeep", "aotr_terrainkeep.inc", "aotr_terrain.inc")) installTerrainKeep();                        // v46: patches out of view keep their textures (camera turning: 2645 rebuilt in 5 s); hash-checked; TERRAINKEEP_OFF
 #ifdef AOTR_DIAG
-        installAbTest();                             // v50 measurement tool: only with AB_ON beside the DLL
+        if (aotrPart("abtest", "aotr_abtest.inc")) installAbTest();                             // v50 measurement tool: only with AB_ON beside the DLL
 #endif
-        installPartEvict();                          // v42: particle limit eviction - no repeated empty scans (exact; PEVICT_OFF)
-        if (!gdNewOff()) installAmFind(); else logf("amfind: not installed (GUARD safe mode).");
-        if (!gdNewOff()) installCbFind(); else logf("cbfind: not installed (GUARD safe mode).");
-        if (!gdNewOff()) installFmFind(); else logf("fmfind: not installed (GUARD safe mode).");
-        if (!gdNewOff()) installMaskFast(); else logf("maskfast: not installed (GUARD safe mode).");
-        if (!gdNewOff()) installHashFind(); else logf("hashfind: not installed (GUARD safe mode).");   // v82: hash map find by multiply (self-proving; HASHFIND_OFF)   // v81: flag mask test in SSE (self-proving; MASKFAST_OFF)   // v81: Object::findModule per object (self-proving; FMFIND_OFF)   // v77: command buttons by name without the walk (self-proving; CBFIND_OFF)
-        if (!gdNewOff()) installPsRemove(); else logf("psremove: not installed (GUARD safe mode).");                           // v55: FX manager remove without walking every system (self-proving; PSREMOVE_OFF)
-        installPsWarm();                             // v54: the particle system list read ahead before update and draw walk it (PSWARM_OFF)
-        installPsFind();                             // v41: ParticleSystemManager::findParticleSystemByID without walking every system (self-proving; PSFIND_OFF)
-        if (!gdNewOff()) installPxPar(); else logf("pxpar: not installed (GUARD safe mode).");
-        if (!gdNewOff()) installTaskWarm(); else logf("taskwarm: not installed (GUARD safe mode).");   // v77: the FX renderer's task list read ahead (prefetch only; TASKWARM_OFF)   // v74: the particles' own update on the spare cores (exact, self-checking; PXPAR_OFF)
+        if (aotrPart("pevict", "aotr_pevict.inc")) installPartEvict();                          // v42: particle limit eviction - no repeated empty scans (exact; PEVICT_OFF)
+        if (!aotrPart("amfind", "aotr_amfind.inc")) {} else if (!gdNewOff()) installAmFind(); else logf("amfind: not installed (GUARD safe mode).");
+        if (!aotrPart("cbfind", "aotr_cbfind.inc")) {} else if (!gdNewOff()) installCbFind(); else logf("cbfind: not installed (GUARD safe mode).");
+        if (!aotrPart("fmfind", "aotr_fmfind.inc")) {} else if (!gdNewOff()) installFmFind(); else logf("fmfind: not installed (GUARD safe mode).");
+        if (!aotrPart("maskfast", "aotr_maskfast.inc")) {} else if (!gdNewOff()) installMaskFast(); else logf("maskfast: not installed (GUARD safe mode).");
+        if (!aotrPart("hashfind", "aotr_hashfind.inc")) {} else if (!gdNewOff()) installHashFind(); else logf("hashfind: not installed (GUARD safe mode).");   // v82: hash map find by multiply (self-proving; HASHFIND_OFF)   // v81: flag mask test in SSE (self-proving; MASKFAST_OFF)   // v81: Object::findModule per object (self-proving; FMFIND_OFF)   // v77: command buttons by name without the walk (self-proving; CBFIND_OFF)
+        if (!aotrPart("psremove", "aotr_psremove.inc")) {} else if (!gdNewOff()) installPsRemove(); else logf("psremove: not installed (GUARD safe mode).");                           // v55: FX manager remove without walking every system (self-proving; PSREMOVE_OFF)
+        if (aotrPart("pswarm", "aotr_pswarm.inc")) installPsWarm();                             // v54: the particle system list read ahead before update and draw walk it (PSWARM_OFF)
+        if (aotrPart("psfind", "aotr_psfind.inc")) installPsFind();                             // v41: ParticleSystemManager::findParticleSystemByID without walking every system (self-proving; PSFIND_OFF)
+        if (!aotrPart("pxpar", "aotr_pxpar.inc")) {} else if (!gdNewOff()) installPxPar(); else logf("pxpar: not installed (GUARD safe mode).");
+        if (!aotrPart("taskwarm", "aotr_taskwarm.inc")) {} else if (!gdNewOff()) installTaskWarm(); else logf("taskwarm: not installed (GUARD safe mode).");   // v77: the FX renderer's task list read ahead (prefetch only; TASKWARM_OFF)   // v74: the particles' own update on the spare cores (exact, self-checking; PXPAR_OFF)
 #ifdef AOTR_DIAG
-        installVmProbe();                            // v77: the page faults' source - commits / frees by caller, working-set trims
-        installFxProbe();                            // v73: the particle update measured - its time and the module classes used (read only)
+        if (aotrPart("vmprobe", "aotr_vmprobe.inc")) installVmProbe();                            // v77: the page faults' source - commits / frees by caller, working-set trims
+        if (aotrPart("fxprobe", "aotr_fxprobe.inc")) installFxProbe();                            // v73: the particle update measured - its time and the module classes used (read only)
 #endif
-        installShadowNbr();                          // v32: shadow edge neighbours without comparing every triangle pair (exact, self-checked, big models on every core)
-        installShadowWeld();                         // v32: shadow mesh vertex weld by grouping equal positions instead of every pair (exact, self-checked)
+        if (aotrPart("shadownbr", "aotr_shadownbr.inc")) installShadowNbr();                          // v32: shadow edge neighbours without comparing every triangle pair (exact, self-checked, big models on every core)
+        if (aotrPart("shadowweld", "aotr_shadowweld.inc")) installShadowWeld();                         // v32: shadow mesh vertex weld by grouping equal positions instead of every pair (exact, self-checked)
         // v33: pose warm (skeleton tree updates on worker threads) measured in the Helm's Deep battle: exact (MISMATCH 0 in
         // ~50 000 updates / 5 s) but no gain - client+drawing 14.56 ms with it against 14.12 ms without (work\ish7 c1_pw /
         // b80p). Not installed; AOTR_POSEWARM2=1 turns it on for a measurement.
-        { char pe[8]; pe[0] = 0; if (GetEnvironmentVariableA("AOTR_POSEWARM2", pe, sizeof(pe)) && pe[0] == '1') { installAnimTimers(); installPoseWarm2(); }
+        { char pe[8]; pe[0] = 0; if (GetEnvironmentVariableA("AOTR_POSEWARM2", pe, sizeof(pe)) && pe[0] == '1') { if (aotrPart("pose-warm2", "aotr_posewarm2.inc")) { installAnimTimers(); installPoseWarm2(); } }
           else logf("pose-warm2: not installed (v33: measured, no gain in the battle frame; AOTR_POSEWARM2=1 for a measurement)."); }
 #ifdef AOTR_DIAG
-        installLoadProf();                           // v31: frames of 80 ms+ - which game.dat functions the game thread was in (read only)
+        if (aotrPart("loadprof", "aotr_loadprof.inc")) installLoadProf();                           // v31: frames of 80 ms+ - which game.dat functions the game thread was in (read only)
 #endif
         installSched();                              // v33: the frame limiter sleeps instead of spinning (same limit, same frame end); measurement options
         installFrameProf();                          // v33: every frame timed in its parts, sampled 50x a second, 'frame:' and 'cores:' every 5 s (read only)
@@ -3254,21 +3294,21 @@ static DWORD WINAPI initThread(LPVOID) {
         installWholeMapTimer();                      // v53: the whole-map partition query timed at its six call sites (read only)
 #endif
         // v64: installShadowHalf() removed for good - test-46: the shadows still flickered and spells (the Army of the Dead) looked wrong
-        installPartFast();                           // v54: its object loop reads memory ahead - same calls, same order (self-proving; PARTFAST_OFF)
+        if (aotrPart("partfast", "aotr_partfast.inc")) installPartFast();                           // v54: its object loop reads memory ahead - same calls, same order (self-proving; PARTFAST_OFF)
         installLogicSpread();                        // needs the frame profiler's logic wrapper above (it measures the steps through it)
         // v37 (test-18 diag: in big battles the sound request limit check 0x456D8B was the single hottest client spot,
         // 8-17% of the client step, growing with the battle; ThingTemplate::isEquivalentTo ~9% of the logic). Both are
         // exact and self-proving (compared with the original, one difference -> off for the session).
         // Off: AUDIOLIMIT_OFF / EQUIV_OFF next to the DLL.
         { char mk[MAX_PATH];
-          if (GetFileAttributesA(aotrPath(mk, "AUDIOLIMIT_OFF")) == INVALID_FILE_ATTRIBUTES) installAudioLimit();
+          if (GetFileAttributesA(aotrPath(mk, "AUDIOLIMIT_OFF")) == INVALID_FILE_ATTRIBUTES) { if (aotrPart("audiolimit", "aotr_audiolimit.inc")) installAudioLimit(); }
           else logf("audiolimit: AUDIOLIMIT_OFF is present - the engine's own list walk stays.");
-          if (GetFileAttributesA(aotrPath(mk, "EQUIV_OFF")) == INVALID_FILE_ATTRIBUTES) installEquivMemo();
+          if (GetFileAttributesA(aotrPath(mk, "EQUIV_OFF")) == INVALID_FILE_ATTRIBUTES) { if (aotrPart("equiv-memo", "aotr_equivmemo.inc")) installEquivMemo(); }
           else logf("equiv-memo: EQUIV_OFF is present - memo OFF.");
           // v45 (test-26: the equivalence memo was asked 1.8 million times a second, mostly from the object filter
           // 0x763543 looping over its template lists; the memo's own call cost was 3-4% of the logic): the filter's
           // template part per (filter, template), self-proving like the others. Off: FILTER_OFF next to the DLL.
-          if (GetFileAttributesA(aotrPath(mk, "FILTER_OFF")) == INVALID_FILE_ATTRIBUTES) installFilterMemo();
+          if (GetFileAttributesA(aotrPath(mk, "FILTER_OFF")) == INVALID_FILE_ATTRIBUTES) { if (aotrPart("filter-memo", "aotr_equivmemo.inc")) installFilterMemo(); }
           else logf("filter-memo: FILTER_OFF is present - memo OFF."); }
         // v40 (measurement): test-21 showed the slow quarter of the battle differs from the fast one by +2-3 ms of logic
         // and +8-10 ms of client step. These name where inside the client step that goes - the client update's call sites
@@ -3276,16 +3316,16 @@ static DWORD WINAPI initThread(LPVOID) {
         // Timing only: every call is made exactly as before.
         // v68: kept for the multiplayer measurement (where the client step's time goes; timing only)
 #ifdef AOTR_DIAG
-        installClientTimers();
-        installFlushTimers();
-        installSubsysTimers();
+        if (aotrPart("clienttime", "aotr_clienttime.inc")) installClientTimers();
+        if (aotrPart("flushtime", "aotr_flushtime.inc")) installFlushTimers();
+        if (aotrPart("subsys", "aotr_subsys.inc")) installSubsysTimers();
         CreateThread(NULL, 0, aotrMarkKeys, NULL, 0, NULL);
 #endif
         CreateThread(NULL, 0, aotrProdReport30, NULL, 0, NULL);   // every 30 s: the learned list saved, the game thread's core kept (its log lines only in the diagnostics build)
         // v34 (ISH-8 #4): both were written in v54/v55, are included above, and lost their install call in v30 (c51fe95)
         // when the ini switches went. Each checks the game's bytes first and changes nothing if they differ.
-        installExitFix();                            // the game's own crash on leaving a skirmish (test-14: C0000005 at game.dat+2B4EAE under the AI reset 0x5B42B0, scanner 0x7EDB5D) - only while that reset runs
-        installStreamSets();                         // the asset streamer completes its wanted-asset sets without copying them (same inserts, same order; the first 48 checked against the engine's own walk)
+        if (aotrPart("exitfix", "aotr_exitfix.inc")) installExitFix();                            // the game's own crash on leaving a skirmish (test-14: C0000005 at game.dat+2B4EAE under the AI reset 0x5B42B0, scanner 0x7EDB5D) - only while that reset runs
+        if (aotrPart("streamsets", "aotr_streamset.inc")) installStreamSets();                         // the asset streamer completes its wanted-asset sets without copying them (same inserts, same order; the first 48 checked against the engine's own walk)
     } else
         logf("init: this build is not one whose addresses were verified - the ground patch and render list parts stay off; the rest runs.");
     logf("init: multicore - render thread %s (the game's D3D9 / D3DX effect calls carried out on their own core, in the same order), texture decoding and mip chains on worker threads (%s), shadow edge neighbours of big models on %d cores, ground patch textures on %d cores, files read ahead on their own thread, DXVK's own threads; the game's logic tick stays on one thread, in step with every other player (multiplayer-safe: no logic code, no logic timing touched).",

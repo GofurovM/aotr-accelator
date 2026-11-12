@@ -5,8 +5,8 @@
 103 ICON "..\\res\\aotr_red.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 84,0,0,134
- PRODUCTVERSION 84,0,0,134
+ FILEVERSION 85,0,0,135
+ PRODUCTVERSION 85,0,0,135
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -17,10 +17,12 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "FileDescription", "AOTR Accelerator - starter"
-            VALUE "FileVersion", "84 (build 134)"
+            VALUE "CompanyName", "AOTR Accelerator project (open source, MIT)"
+            VALUE "FileDescription", "AOTR Accelerator - starter (installs and loads the performance add-on for Age of the Ring)"
+            VALUE "InternalName", "aotr_start"
+            VALUE "FileVersion", "85 (build 135)"
             VALUE "ProductName", "AOTR Accelerator"
-            VALUE "ProductVersion", "84 (build 134)"
+            VALUE "ProductVersion", "85 (build 135)"
             VALUE "OriginalFilename", "AOTR_ACCELERATOR.exe"
             VALUE "LegalCopyright", "MIT license - based on BFME2 Accelerator by Ohad Baehr"
         END

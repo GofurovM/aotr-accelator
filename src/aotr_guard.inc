@@ -11,7 +11,7 @@
 //   * a watchdog thread: no picture for 20 s with the game's thread busy -> one log line naming it as a hang, where
 //     the guard state was, and that the next start will be safe if this ends here.
 // A new build starts clean. Delete out\aotr_guard.txt to clear it by hand.
-#define AOTR_BUILDNO_GUARD 134                                     // = AOTR_BUILDNO (checked where that is defined)
+#define AOTR_BUILDNO_GUARD 135                                     // = AOTR_BUILDNO (checked where that is defined)
 static char g_gdPath[MAX_PATH]; static volatile LONG g_gdSafe = 0, g_gdFrames = 0, g_gdSteps = 0, g_gdState = 0, g_gdPlayed = 0;
 static const char* const kGdState[] = { "started", "loading", "playing" };
 static void gdWrite() {

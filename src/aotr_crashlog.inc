@@ -34,6 +34,7 @@ static void clReport() {                                   // from the 30 s prod
     logf("%s", ln);
     lA = a; lS = sN; lG = g;
 }
+static DWORD g_clProbe[16]; static int g_clProbeN = 0;   // the entry points of Windows' IsBad*Ptr functions
 static LONG CALLBACK clHandler(EXCEPTION_POINTERS* ep) {
     if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -41,6 +42,8 @@ static LONG CALLBACK clHandler(EXCEPTION_POINTERS* ep) {
     if (code != 0xC0000005u && code != 0xC000001Du && code != 0xC00000FDu && code != 0xC0000094u) return EXCEPTION_CONTINUE_SEARCH;
     { DWORD ip = (DWORD)(ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;                         // this DLL's own guarded probes fault on purpose and handle it themselves (v25: they used up the entries)
       if (g_selfLo && ip >= g_selfLo && ip < g_selfHi) return EXCEPTION_CONTINUE_SEARCH; }
+    { DWORD ip = (DWORD)(ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;                         // v85: Windows' IsBad*Ptr probe memory by faulting on purpose and
+      for (int i = 0; i < g_clProbeN; ++i) if (ip - g_clProbe[i] < 0x100) return EXCEPTION_CONTINUE_SEARCH; }   // handle it themselves (v84 test: a "crash" at IsBadStringPtrW+2A that was not one)
     if (InterlockedIncrement(&g_clN) > 12) return EXCEPTION_CONTINUE_SEARCH;
     if (InterlockedExchange(&g_clBusy, 1)) return EXCEPTION_CONTINUE_SEARCH;               // an exception raised while this handler is writing: not its business
     fdbWFlushAllNoLock(true);                                                                 // v34: writes still collected go to their files first (nothing the game wrote is lost in a crash)
@@ -108,5 +111,9 @@ static void installCrashLog() {
     if (!g_selfLo) { HMODULE hs = NULL;
         if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&clHandler, &hs) && hs) {
             IMAGE_NT_HEADERS* nh = (IMAGE_NT_HEADERS*)((BYTE*)hs + ((IMAGE_DOS_HEADER*)hs)->e_lfanew); g_selfLo = (DWORD)(ULONG_PTR)hs; g_selfHi = g_selfLo + nh->OptionalHeader.SizeOfImage; } }
+    { static const char* const kDll[] = { "kernel32.dll", "kernelbase.dll" };
+      static const char* const kFn[] = { "IsBadReadPtr", "IsBadWritePtr", "IsBadStringPtrA", "IsBadStringPtrW", "IsBadCodePtr", "IsBadHugeReadPtr", "IsBadHugeWritePtr" };
+      for (int d = 0; d < 2; ++d) { HMODULE h = GetModuleHandleA(kDll[d]); if (!h) continue;
+          for (int f = 0; f < 7 && g_clProbeN < 16; ++f) { FARPROC a = GetProcAddress(h, kFn[f]); if (a) g_clProbe[g_clProbeN++] = (DWORD)(ULONG_PTR)a; } } }
     if (AddVectoredExceptionHandler(1, clHandler)) logf("crashlog: fatal exceptions will be written here with their call chain (nothing is handled or changed).");
 }

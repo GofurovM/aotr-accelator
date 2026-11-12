@@ -156,18 +156,12 @@ static bool isAotrGame(const char* gamePath) {
     FindClose(h);
     return true;
 }
-static void enableDebugPrivilege() {
-    HANDLE tok;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &tok)) return;
-    TOKEN_PRIVILEGES tp; tp.PrivilegeCount = 1; tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (LookupPrivilegeValueA(NULL, "SeDebugPrivilege", &tp.Privileges[0].Luid))
-        AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), NULL, NULL);
-    CloseHandle(tok);
-}
 // 32-bit loader, 32-bit game: kernel32's LoadLibraryA is at the same address in both
 static bool injectInto(DWORD pid) {
-    HANDLE hp = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
-                            PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
+    // v85: only the rights the load needs, and no debug privilege: the game runs as the same user (the AotR launcher
+    // starts it, this program has the same rights), so nothing more is required - and asking for more is what
+    // antivirus heuristics read as an attack on another process.
+    HANDLE hp = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, pid);
     if (!hp) return false;
     DWORD code = 0;
     if (GetExitCodeProcess(hp, &code) && code != STILL_ACTIVE) { CloseHandle(hp); return false; }   // died during start-up
@@ -867,7 +861,6 @@ static int resident(bool launch) {
             return 0;
         }
     }
-    enableDebugPrivilege();
     if (!g_aotrExe[0] && findAotr(false)) folderOf(g_aotrExe, g_aotrRoot, sizeof(g_aotrRoot));
     { char f[MAX_PATH]; powFile(f); if (exists(f)) powRestore(false); }   // a session that ended without putting them back
     WNDCLASSW wc; ZeroMemory(&wc, sizeof(wc)); wc.lpfnWndProc = wndProc; wc.hInstance = g_hi; wc.lpszClassName = kWndClass;
